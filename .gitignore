@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+# Blender writes these next to the modules
+*.blend1
+*.blend2
+
+# test tiles / round-trip artifacts (steam-tile sized, never commit)
+*.mesh
+*.mesh.tmp
+*.7z
+
+.DS_Store
+.venv/
+venv/
