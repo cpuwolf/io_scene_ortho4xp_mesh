@@ -1,10 +1,11 @@
 bl_info = {
     "name": "Ortho4XP Mesh Import/Export",
     "author": "built for rourou",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 0, 0),
     "location": "File > Import/Export > Ortho4XP Mesh; View3D > Sidebar > Ortho4XP",
-    "description": "Read and write Ortho4XP tile meshes (.mesh)",
+    "description": "Read and write Ortho4XP tile meshes (.mesh) with the tile's "
+                   ".ter orthophotos",
     "category": "Import-Export",
 }
 
@@ -37,17 +38,28 @@ Format (MEDITS, ASCII, one element per line)
     <T>
     <v1> <v2> <v3> <attr>
 
-Quirks that this addon knows about (all verified against a real tile):
+Two flavours of that format are in the wild, and this addon reads and writes both
+byte-exactly:
+
+    Ortho4XP 1.30 (2023)                1.4 fork ("v2")
+    MeshVersionFormatted 1.30           MeshVersionFormatted 2
+    '{:.7f}' coordinates                '{:.15f}' coordinates
+    '%.2f %.2f'   normals (2 columns)   '%.2f %.2f 0' normals (3 columns)
+
+The flavour, line endings and coordinate precision are detected on import, stored
+on the object and reproduced on export by default ("File flavour: same as source").
+
+Quirks that this addon knows about (all verified against real tiles):
   * `lon`/`lat` are absolute WGS84 degrees, `z` is the elevation in units of
     100000 m (`alt_m = z * 1e5`), and triangle indices are 1-based.
   * the 4th vertex field is a MEDITS "reference": always 0 in Ortho4XP output.
   * the 3rd normal field is a literal `0` placeholder -- only `nx`, `ny` are real
     (X-Plane stores two normal components and implies +up), so the true normal is
-    (nx, ny, sqrt(1-nx^2-ny^2)).
+    (nx, ny, sqrt(1-nx^2-ny^2)).  Ortho4XP 1.30 omits the column entirely.
   * `attr` is the Triangle4XP region bit mask copied from the .ele file:
     1 WATER, 2 SEA, 4 SEA_EQUIV, 8 INTERP_ALT, 16 RUNWAY, 32 TAXIWAY, 64 APRON,
     128 HANGAR, 0 DUMMY.
-  * `MeshVersionFormatted` is hard-coded to 2 while `build_dsf` branches on it
+  * `MeshVersionFormatted` is not free-form: `build_dsf` branches on it
     (`has_water = 7 if version >= 1.3 else 3`).
   * a Windows build writes CRLF line endings, and there is no trailing `End`.
 
@@ -67,15 +79,41 @@ exact to ~3e-8 degrees (measured 1.95 mm horizontal / 0.12 mm vertical on a full
 1x1 degree tile) rather than bit-exact; the DSF point pools quantize to 0.2 m, so
 this is far below what the pipeline can represent.
 
+Terrain textures (.ter)
+-----------------------
+A .mesh carries no terrain reference, so the orthophotos are rebuilt from the tile:
+Ortho4XP writes one `.ter` per ortho cell in the tile's `terrain/` folder, and each
+one declares the footprint its texture covers:
+
+    LOAD_CENTER <lat> <lon> <size_m> <tex_px>
+    BASE_TEX_NOWRAP ../textures/<cell>.dds
+
+Those footprints are a spatial index: every face is assigned to the cell whose
+footprint contains its centroid, gets that cell's material, and is UV-mapped once
+over that footprint (the cell centre lands on 0.5, 0.5) -- which is what X-Plane
+does when it renders the same tile.  The tiling itself comes from the *observed*
+lattice rather than from `size_m`: measured on a real tile the declared size is
+~0.1% narrow in longitude and ~0.6% tall in latitude versus the actual centre
+spacing, which would leave bands of untextured faces along the borders of every
+patch of a finer zoom level.  A tile that mixes zoom levels (ZL17 with ZL19
+patches) is handled by letting the finer cells win, and a `_sea_overlay.ter` wins
+over the plain `.ter` of the same footprint because that is the definition
+Ortho4XP's own DSF uses for those cells.
+
+Note the consequence for materials: a face has exactly one material slot, so
+"Material slot per triangle attribute" is skipped when textures are imported (the
+`mesh_attr` attribute is written regardless, and still drives the export).
+
 Round-trip
 ----------
 The triangle attributes and vertex normals are stored on the import (a `mesh_attr`
 face attribute and a `mesh_normals` point attribute) and written back verbatim, so
 exporting an untouched tile reproduces the original file: the codec itself is
-byte-exact (verified on a 288 MB / 2.29 M-vertex / 4.58 M-triangle tile,
-sha256-identical), and the Blender round trip differs only by float32 vertex
-rounding.  Tick "Recompute normals" on export after editing geometry, otherwise
-the tile keeps the normals it was imported with.
+byte-exact (verified on a 288 MB / 2.29 M-vertex / 4.58 M-triangle v2 tile and a
+119 MB / 1.25 M-vertex / 2.48 M-triangle 1.30 tile, both sha256-identical), and the
+Blender round trip differs only by float32 vertex rounding.  Tick "Recompute
+normals" on export after editing geometry, otherwise the tile keeps the normals it
+was imported with.
 """
 
 import json
@@ -88,9 +126,13 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import meshcodec as MC
+from . import terrain_tiles as TT
 
 R_EARTH = 6378137.0          # WGS84 semi-major axis, metres (matches O4_Geo_Utils)
 DEG = math.pi / 180.0
+
+#: name of the UV layer, shared with the DSF addon so both imports look the same
+UV_LAYER = "XPlaneProjected"
 
 #: viewport colours per triangle attribute, for the material slots
 ATTR_COLORS = {
@@ -105,6 +147,12 @@ ATTR_COLORS = {
     128: (0.55, 0.35, 0.65, 1.0),    # HANGAR
 }
 _ATTR_DOMINANT = (128, 64, 32, 16, 8, 4, 2, 1)
+
+#: flavour -> (header version text, coordinate format, normal columns)
+FLAVOURS = {
+    MC.FLAVOUR_V2: ("2", "{:.15f}", 3),
+    MC.FLAVOUR_V13: ("1.30", "{:.7f}", 2),
+}
 
 
 # --------------------------------------------------------------- helpers
@@ -215,6 +263,288 @@ def _new_vertex_mesh(name, co, tris):
     return me
 
 
+# ------------------------------------------------- terrain textures (.ter)
+def _file_dimensions(path):
+    """(w, h) from the file header, for cases where Blender reports (0, 0).
+
+    Blender can report size (0, 0) for a DDS/DXT file until its pixels are touched,
+    which would silently defeat `tex_max_px` (a ``0 > n`` test never fires), so the
+    header is read directly when that happens.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+    except OSError:
+        return None
+    if head[:4] == b"DDS " and len(head) >= 20:
+        h = int.from_bytes(head[12:16], "little")
+        w = int.from_bytes(head[16:20], "little")
+        return (w, h) if w and h else None
+    if head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) >= 24:
+        w = int.from_bytes(head[16:20], "big")
+        h = int.from_bytes(head[20:24], "big")
+        return (w, h) if w and h else None
+    return None
+
+
+def _load_image(path, max_px=0):
+    """Load (or reuse) an image, optionally downscaling it to cap memory.
+
+    Blender decodes an image only when something displays it, so a plain load is
+    cheap (measured +0.4 MB each).  A 4096x2560 orthophoto costs ~250 MB while
+    decoded, and a ZL18 tile has ~1000 of them, so `max_px` decodes and resizes
+    now (peak ~250 MB per image, transient) to keep viewing many cells affordable.
+    """
+    if not path:
+        return None
+    try:
+        img = bpy.data.images.load(path, check_existing=True)
+    except Exception as ex:                                    # noqa: BLE001
+        print("[Ortho4XP mesh import] cannot load %s: %s"
+              % (os.path.basename(path), ex))
+        return None
+    if max_px:
+        w, h = img.size
+        if not (w and h):
+            w, h = _file_dimensions(path) or (0, 0)
+        if max(w, h) > max_px:
+            s = max_px / float(max(w, h))
+            try:
+                img.scale(max(1, int(round(w * s))), max(1, int(round(h * s))))
+            except Exception as ex:                            # noqa: BLE001
+                print("[Ortho4XP mesh import] cannot scale %s: %s" % (img.name, ex))
+        if max(img.size) > max_px:
+            print("[Ortho4XP mesh import] %s stayed at %s (%sx%s) -- this Blender "
+                  "build would not downscale it"
+                  % (os.path.basename(path), tuple(img.size), w, h))
+    return img
+
+
+def _store_ter_metadata(mat, cell):
+    """Record what the cell's .ter said, so the material stays self-describing.
+
+    Kept even when the texture itself is not loaded (see `tex_limit`): the .ter
+    path, its texture roles and the mapping parameters are always on the material.
+    """
+    mat["mesh_ter_kind"] = "ter"
+    mat["mesh_ter_path"] = cell.path
+    mat["mesh_ter_textures"] = json.dumps(cell.textures)
+    if cell.lat is not None:
+        mat["mesh_ter_center"] = json.dumps(
+            [cell.lat, cell.lon, cell.size_m, cell.size_px])
+    if cell.border:
+        mat["mesh_ter_center_border"] = json.dumps(cell.border)
+    if cell.projected:
+        mat["mesh_ter_projected"] = json.dumps(list(cell.projected))
+    mat["mesh_ter_nowrap"] = bool(cell.nowrap)
+    if cell.overlay:
+        mat["mesh_ter_overlay"] = True
+
+
+def _apply_terrain_texture(mat, cell, max_px=0):
+    """Wire one cell's .ter into a material; returns how many images were loaded.
+
+    Same policy as the DSF importer: the base texture drives Base Color, a
+    NORMAL_TEX gets a normal-map node, and the remaining layers (lit, composite,
+    border) are imported as labelled but unconnected nodes -- blending them needs
+    the per-vertex factor that lives in the DSF, which a .mesh does not carry, so
+    inventing a factor would be a lie.
+    """
+    _store_ter_metadata(mat, cell)
+    ter = cell.ter
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    out.location = (540, 0)
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (240, 0)
+    nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    try:
+        bsdf.inputs["Roughness"].default_value = 1.0
+    except Exception:                                          # noqa: BLE001
+        pass
+
+    extension = "EXTEND" if cell.nowrap else "REPEAT"
+    loaded = 0
+    base = ter.texture_abs("base") or ter.texture_abs("other")
+    img = _load_image(base, max_px)
+    if img is not None:
+        loaded += 1
+        img.colorspace_settings.name = "sRGB"
+        node = nt.nodes.new("ShaderNodeTexImage")
+        node.location = (-560, 140)
+        node.label = "BASE_TEX"
+        node.image = img
+        node.extension = extension
+        nt.links.new(node.outputs["Color"], bsdf.inputs["Base Color"])
+
+    n_img = _load_image(ter.texture_abs("normal"), max_px)
+    if n_img is not None:
+        loaded += 1
+        n_img.colorspace_settings.name = "Non-Color"
+        node = nt.nodes.new("ShaderNodeTexImage")
+        node.location = (-560, -160)
+        node.label = "NORMAL_TEX"
+        node.image = n_img
+        node.extension = extension
+        nmap = nt.nodes.new("ShaderNodeNormalMap")
+        nmap.location = (-280, -160)
+        nt.links.new(node.outputs["Color"], nmap.inputs["Color"])
+        nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+
+    for role, y in (("lit", -420), ("composite", -640), ("border", -860)):
+        r_img = _load_image(ter.texture_abs(role), max_px)
+        if r_img is None:
+            continue
+        loaded += 1
+        r_img.colorspace_settings.name = "sRGB"
+        node = nt.nodes.new("ShaderNodeTexImage")
+        node.location = (-560, y)
+        node.label = role.upper() + "_TEX (imported, not blended)"
+        node.image = r_img
+        node.extension = extension
+    return loaded
+
+
+def _import_terrain_textures(op, obj, me, m, georef):
+    """Give the tile its orthophotos: a material per .ter cell + one UV layer.
+
+    Returns a stats dict (also stored on the object as `mesh_tex_stats`).
+    """
+    tdir = (op.terrain_dir or "").strip() or TT.find_terrain_dir(op.filepath)
+    stats = {"terrain_dir": tdir, "cells": 0, "cells_used": 0, "materials": 0,
+             "faces_total": int(m.n_tri), "faces_textured": 0, "faces_uncovered": 0,
+             "images_loaded": 0, "cells_with_image": 0, "uv_layer": None,
+             "skipped_ter": 0, "overlay_cells": 0, "max_px": int(op.tex_max_px)}
+    if not tdir:
+        print("[Ortho4XP mesh import] no terrain folder found next to %s; "
+              "no textures imported" % os.path.basename(op.filepath))
+        return stats
+
+    cells, skipped = TT.scan_terrain([tdir])
+    stats["cells"] = len(cells)
+    stats["skipped_ter"] = len(skipped)
+    stats["overlay_cells"] = sum(1 for c in cells if c.overlay)
+    if not cells:
+        print("[Ortho4XP mesh import] %s holds %d .ter file(s) but none declares a "
+              "LOAD_CENTER footprint; no textures imported"
+              % (tdir, len(skipped)))
+        return stats
+    try:
+        index = TT.TerrainIndex(cells)
+    except ValueError as ex:
+        print("[Ortho4XP mesh import] cannot index the terrain cells: %s" % ex)
+        return stats
+
+    face_cell, _clat, _clon = index.centroid_cells(m.lat, m.lon, m.tris)
+    covered = int(np.count_nonzero(face_cell >= 0))
+    stats["faces_textured"] = covered
+    stats["faces_uncovered"] = int(face_cell.size - covered)
+
+    # one material per used cell, the cells owning the most faces first
+    used, counts = np.unique(face_cell[face_cell >= 0], return_counts=True)
+    order = used[np.argsort(-counts)]
+    stats["cells_used"] = int(order.size)
+    n_load = order.size if not op.tex_limit else min(int(op.tex_limit), order.size)
+    load_set = {int(i) for i in order[:n_load]}
+    slot_of = {}
+    for i in order:
+        cell = cells[int(i)]
+        mat = bpy.data.materials.new("ter_%s" % cell.label)
+        if int(i) in load_set:
+            n_img = _apply_terrain_texture(mat, cell, int(op.tex_max_px))
+            stats["images_loaded"] += n_img
+            if n_img:
+                stats["cells_with_image"] += 1
+        else:
+            _store_ter_metadata(mat, cell)
+        slot_of[int(i)] = len(obj.data.materials)
+        obj.data.materials.append(mat)
+
+    # faces with no cell get their own slot, so a gap shows up instead of being
+    # silently painted with a neighbour's texture
+    if stats["faces_uncovered"]:
+        gap = bpy.data.materials.new("ter_none_uncovered")
+        gap.diffuse_color = (1.0, 0.15, 0.15, 1.0)
+        gap["mesh_ter_kind"] = "none"
+        slot_of[-1] = len(obj.data.materials)
+        obj.data.materials.append(gap)
+    face_slot = np.zeros(face_cell.size, dtype=np.int32)
+    for i in np.unique(face_cell):
+        face_slot[face_cell == i] = slot_of[int(i)]
+    me.polygons.foreach_set("material_index", face_slot)
+    stats["materials"] = len(obj.data.materials)
+
+    # ---- UVs: per loop, computed from the cell that owns the face
+    loop_total = np.empty(len(me.polygons), dtype=np.int32)
+    me.polygons.foreach_get("loop_total", loop_total)
+    loop_vert = np.empty(len(me.loops), dtype=np.int32)
+    me.loops.foreach_get("vertex_index", loop_vert)
+    loop_cell = np.repeat(face_cell, loop_total)
+    co = np.empty(len(me.vertices) * 3, dtype=np.float64)
+    me.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    lat_l = georef["lat0"] + co[loop_vert, 1] / georef["m_per_deg_lat"]
+    lon_l = georef["lon0"] + co[loop_vert, 0] / georef["m_per_deg_lon"]
+    u = np.zeros(lat_l.size)
+    v = np.zeros(lat_l.size)
+
+    valid = loop_cell >= 0
+    lc = loop_cell[valid]
+    if lc.size:
+        n_cells = len(cells)
+        c_lat = np.zeros(n_cells)
+        c_lon = np.zeros(n_cells)
+        c_size = np.ones(n_cells)
+        c_center = np.zeros(n_cells, dtype=bool)
+        c_xs = np.ones(n_cells)
+        c_ys = np.ones(n_cells)
+        c_ox = np.zeros(n_cells)
+        c_oy = np.zeros(n_cells)
+        c_proj = np.zeros(n_cells, dtype=bool)
+        for i, c in enumerate(cells):
+            if c.lat is not None:
+                c_lat[i], c_lon[i] = c.lat, c.lon
+                c_size[i] = c.size_m or 1.0
+                c_center[i] = True
+            if c.projected:
+                c_proj[i] = True
+                c_xs[i], c_ys[i] = c.projected[0], c.projected[1]
+        hw = (georef["east"] - georef["west"]) * 0.5 * georef["m_per_deg_lon"]
+        hh = (georef["north"] - georef["south"]) * 0.5 * georef["m_per_deg_lat"]
+        llat = lat_l[valid]
+        llon = lon_l[valid]
+        uu = np.zeros(lc.size)
+        vv = np.zeros(lc.size)
+        center = c_center[lc]
+        if np.any(center):
+            uu[center], vv[center] = TT.uv_center(
+                c_lat[lc[center]], c_lon[lc[center]], c_size[lc[center]],
+                llat[center], llon[center])
+        proj = c_proj[lc] & ~center
+        if np.any(proj):
+            lv = loop_vert[valid][proj]
+            uu[proj], vv[proj] = TT.uv_projected(
+                co[lv, 0], co[lv, 1], c_xs[lc[proj]], c_ys[lc[proj]],
+                c_ox[lc[proj]], c_oy[lc[proj]], hw, hh)
+        uv_skip = int(np.count_nonzero(~(center | proj)))
+        if uv_skip:
+            print("[Ortho4XP mesh import] %d loop(s) on faces whose .ter has neither "
+                  "LOAD_CENTER nor PROJECTED: UVs left at 0" % uv_skip)
+        u[valid] = uu
+        v[valid] = vv
+
+    flat = np.empty(lat_l.size * 2, dtype=np.float32)
+    flat[0::2] = u
+    flat[1::2] = v
+    layer = me.uv_layers.get(UV_LAYER) or me.uv_layers.new(name=UV_LAYER)
+    layer.data.foreach_set("uv", flat)
+    obj["mesh_uv_layer"] = layer.name
+    stats["uv_layer"] = layer.name
+    return stats
+
+
 # --------------------------------------------------------------- import
 class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
     """Import an Ortho4XP tile mesh (.mesh)"""
@@ -246,8 +576,38 @@ class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
         name="Material slot per triangle attribute",
         description="Give every triangle attribute (water, sea, runway, ...) its "
                     "own material slot with a viewport colour, so the water cuts "
-                    "and airport flattening are visible at a glance",
+                    "and airport flattening are visible at a glance. Skipped when "
+                    "terrain textures are imported: a face has one material slot, "
+                    "and the orthophoto wins",
         default=True,
+    )
+    import_textures: BoolProperty(
+        name="Terrain textures (.ter)",
+        description="Read the .ter files of the tile next to the .mesh, work out "
+                    "which ortho cell each face belongs to from their LOAD_CENTER "
+                    "footprints, give every cell its own material and UV-map each "
+                    "face once over its own cell. Turn off for a geometry-only "
+                    "import",
+        default=True,
+    )
+    terrain_dir: StringProperty(
+        name="Terrain folder", subtype="DIR_PATH", default="",
+        description="Folder holding the tile's .ter files; leave empty to use the "
+                    "'terrain' folder next to the .mesh",
+    )
+    tex_limit: IntProperty(
+        name="Max textures", default=0, min=0,
+        description="Load images for at most this many cells, the cells owning the "
+                    "most faces first (0 = every cell). Materials, metadata and UVs "
+                    "are created for all of them either way; only the image is "
+                    "skipped",
+    )
+    tex_max_px: IntProperty(
+        name="Max texture size", default=0, min=0, max=8192,
+        description="Decode each texture and downscale it to at most this many "
+                    "pixels (0 = leave at native size). A 4096x2560 orthophoto "
+                    "costs ~250 MB once Blender decodes it and a ZL18 tile has "
+                    "~1000 cells, so 1024-2048 keeps a whole tile viewable",
     )
     smooth: BoolProperty(
         name="Smooth shading",
@@ -317,10 +677,21 @@ class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
             flags = np.ones(len(me.polygons), dtype=bool)
             me.polygons.foreach_set("use_smooth", flags)
 
+        # ---- terrain textures from the tile's .ter cells
+        tex_stats = None
+        if self.import_textures:
+            try:
+                tex_stats = _import_terrain_textures(self, obj, me, m, georef)
+            except Exception as ex:                            # noqa: BLE001
+                print("[Ortho4XP mesh import] terrain textures failed: %s" % ex)
+                self.report({"WARNING"}, "Terrain textures failed: %s" % ex)
+
         # ---- material slots per triangle attribute
+        # (only without textures: a face has one material index, so the two
+        # assignments cannot coexist -- the orthophoto wins)
         slots = {}
         counts = m.attribute_counts()
-        if self.attr_slots:
+        if self.attr_slots and not (tex_stats and tex_stats.get("materials")):
             for value in counts:
                 label = MC.attribute_name(value)
                 mat = bpy.data.materials.new("mesh_attr_%d_%s" % (value, label))
@@ -338,6 +709,10 @@ class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
         obj["mesh_georef"] = json.dumps(georef)
         obj["mesh_meta"] = json.dumps({
             "version": m.version,
+            "version_text": m.version_text,
+            "flavour": m.flavour,
+            "vert_fmt": m.vert_fmt,
+            "normal_cols": m.normal_cols,
             "crlf": m.crlf,
             "vertices": m.n_vert,
             "triangles": m.n_tri,
@@ -349,17 +724,35 @@ class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
                              else int(np.count_nonzero(m.vtag))),
             "source": os.path.basename(self.filepath),
         })
+        if tex_stats is not None:
+            obj["mesh_tex_stats"] = json.dumps(tex_stats)
         obj["mesh_source"] = self.filepath
         obj["mesh_unit_scale"] = 1.0        # Blender units are metres here
 
-        info = ("Ortho4XP mesh '%s': %d vertices, %d triangles, attrs %s"
-                % (name, m.n_vert, m.n_tri, ", ".join(
+        info = ("Ortho4XP mesh '%s' (v%s): %d vertices, %d triangles, attrs %s"
+                % (name, m.version_text, m.n_vert, m.n_tri, ", ".join(
                     "%s(%d)" % (MC.attribute_name(v), c)
                     for v, c in counts.items())))
         print("[Ortho4XP mesh import] " + m.summary())
         print("[Ortho4XP mesh import] lon %.6f..%.6f lat %.6f..%.6f, tile origin "
-              "%.1f/%.1f, local metres, CRLF=%s"
-              % (west, east, south, north, georef["lon0"], georef["lat0"], m.crlf))
+              "%.1f/%.1f, local metres, %s, flavour %s"
+              % (west, east, south, north, georef["lon0"], georef["lat0"],
+                 "CRLF" if m.crlf else "LF", m.flavour))
+        if tex_stats is not None:
+            print("[Ortho4XP mesh import] terrain: %d cell(s) in %s, %d used by "
+                  "faces, %d material(s), %d image(s) loaded, %d face(s) without "
+                  "a cell"
+                  % (tex_stats["cells"], tex_stats["terrain_dir"],
+                     tex_stats["cells_used"], tex_stats["materials"],
+                     tex_stats["images_loaded"], tex_stats["faces_uncovered"]))
+            if tex_stats["faces_uncovered"]:
+                frac = 100.0 * tex_stats["faces_uncovered"] / max(1, m.n_tri)
+                self.report({"INFO"}, "%d face(s) (%.2f%%) have no ortho cell and "
+                            "got the 'ter_none_uncovered' slot"
+                            % (tex_stats["faces_uncovered"], frac))
+            if tex_stats["skipped_ter"]:
+                print("[Ortho4XP mesh import] %d .ter file(s) skipped (no "
+                      "LOAD_CENTER footprint)" % tex_stats["skipped_ter"])
         if self.report_extra:
             if m.unknown_sections:
                 print("[Ortho4XP mesh import] skipped sections: %s"
@@ -410,12 +803,21 @@ class EXPORT_OT_ortho4xp_mesh(bpy.types.Operator, ExportHelper):
         name="Tile south latitude", default=0.0, precision=6,
         description="Latitude of the south-west corner of the 1x1 degree tile",
     )
-    version: IntProperty(
-        name="Mesh version",
-        description="Written as 'MeshVersionFormatted <n>'. Ortho4XP hard-codes 2, "
-                    "and build_dsf only distinguishes >= 1.3 (water=7) from below "
-                    "(water=3)",
-        default=2, min=0, max=9,
+    flavour: EnumProperty(
+        name="File flavour",
+        description="Which writer's formatting to reproduce. Both flavours hold "
+                    "identical geometry; they differ in the header version string, "
+                    "the decimals on coordinates and whether the normal block has "
+                    "a (literal 0) third column",
+        items=[("SOURCE", "Same as the source file",
+                "Keep the flavour of the imported tile"),
+               ("V2", "Ortho4XP 1.4 (v2)",
+                "'MeshVersionFormatted 2', '{:.15f}' coordinates, "
+                "3-column normals -- what a current 1.4 build writes"),
+               ("V13", "Ortho4XP 1.30",
+                "'MeshVersionFormatted 1.30', '{:.7f}' coordinates, "
+                "2-column normals -- what 1.30 wrote")],
+        default="SOURCE",
     )
     line_ending: EnumProperty(
         name="Line endings",
@@ -438,7 +840,8 @@ class EXPORT_OT_ortho4xp_mesh(bpy.types.Operator, ExportHelper):
     zero_nz: BoolProperty(
         name="Zero third normal component",
         description="Write a literal 0 as the third normal component, as Ortho4XP "
-                    "does",
+                    "1.4 does. Only affects the v2 flavour: the 1.30 flavour has "
+                    "no third column",
         default=True,
     )
 
@@ -482,14 +885,30 @@ class EXPORT_OT_ortho4xp_mesh(bpy.types.Operator, ExportHelper):
                                 "degree tile -- export one tile at a time.")
                     return {"CANCELLED"}
 
+        src_flavour = None
         for o in objs:
             meta = o.get("mesh_meta")
             if meta:
                 try:
-                    crlf_from_source = json.loads(meta).get("crlf")
+                    d = json.loads(meta)
+                    crlf_from_source = d.get("crlf")
+                    src_flavour = d.get("flavour")
                     break
                 except Exception:                              # noqa: BLE001
                     pass
+
+        # ---- flavour: the source's own formatting unless overridden
+        if self.flavour == "V2":
+            flavour = MC.FLAVOUR_V2
+        elif self.flavour == "V13":
+            flavour = MC.FLAVOUR_V13
+        else:
+            flavour = {MC.FLAVOUR_V2: MC.FLAVOUR_V2,
+                       MC.FLAVOUR_V13: MC.FLAVOUR_V13}.get(src_flavour, MC.FLAVOUR_V2)
+            if src_flavour is None:
+                print("[Ortho4XP mesh export] no source flavour recorded; writing "
+                      "the Ortho4XP 1.4 (v2) flavour")
+        ver_txt, vert_fmt, normal_cols = FLAVOURS[flavour]
 
         # ---- gather geometry
         lon_parts, lat_parts, alt_parts = [], [], []
@@ -568,7 +987,8 @@ class EXPORT_OT_ortho4xp_mesh(bpy.types.Operator, ExportHelper):
         mesh = MC.OrthoMesh(
             lon, lat, alt,
             np.concatenate(tri_parts), np.concatenate(attr_parts),
-            version=self.version,
+            version=float(ver_txt), version_text=ver_txt,
+            vert_fmt=vert_fmt, normal_cols=normal_cols,
             nx=np.concatenate(nx_parts), ny=np.concatenate(ny_parts),
             nz=np.concatenate(nz_parts),
             crlf=(crlf_from_source if (self.line_ending == "SOURCE"
@@ -577,18 +997,18 @@ class EXPORT_OT_ortho4xp_mesh(bpy.types.Operator, ExportHelper):
         )
 
         try:
-            nbytes = MC.write_mesh(self.filepath, mesh)
+            nbytes = MC.write_mesh(self.filepath, mesh, flavour=flavour)
         except Exception as ex:                                # noqa: BLE001
             self.report({"ERROR"}, "Export failed: %s" % ex)
             return {"CANCELLED"}
 
         counts = mesh.attribute_counts()
         msg = ("Wrote %s (%d bytes): %d vertices, %d triangles from %d object(s), "
-               "lon %.6f..%.6f lat %.6f..%.6f, attrs %s"
+               "lon %.6f..%.6f lat %.6f..%.6f, flavour %s, attrs %s"
                % (os.path.basename(self.filepath), nbytes, mesh.n_vert,
                   mesh.n_tri, len(objs), lon.min(), lon.max(), lat.min(),
-                  lat.max(), ", ".join("%s(%d)" % (MC.attribute_name(v), c)
-                                       for v, c in counts.items())))
+                  lat.max(), flavour, ", ".join("%s(%d)" % (MC.attribute_name(v), c)
+                                                for v, c in counts.items())))
         print("[Ortho4XP mesh export] " + msg)
         if n_gons:
             self.report({"INFO"},
@@ -635,8 +1055,9 @@ class MESH_PT_ortho4xp_panel(bpy.types.Panel):
                 d = json.loads(meta)
             except Exception:                                  # noqa: BLE001
                 d = {}
-            box.label(text="source v%s, %s"
-                          % (d.get("version", "?"),
+            box.label(text="source v%s [%s], %s"
+                          % (d.get("version_text", d.get("version", "?")),
+                             d.get("flavour", "?"),
                              "CRLF" if d.get("crlf") else "LF"))
             cnt = d.get("attribute_counts") or {}
             if cnt:
@@ -646,6 +1067,31 @@ class MESH_PT_ortho4xp_panel(bpy.types.Panel):
                     col.label(text="  %s: %d" % (MC.attribute_name(int(value)), n))
             if d.get("source"):
                 box.label(text=d["source"], icon="FILE")
+        tex = obj.get("mesh_tex_stats")
+        if tex:
+            try:
+                t = json.loads(tex)
+            except Exception:                                  # noqa: BLE001
+                t = {}
+            col = box.column(align=True)
+            col.label(text="terrain textures:", icon="TEXTURE")
+            col.label(text="  %d of %d cells used by faces"
+                          % (t.get("cells_used", 0), t.get("cells", 0)))
+            col.label(text="  %d faces textured, %d without a cell"
+                          % (t.get("faces_textured", 0), t.get("faces_uncovered", 0)))
+            if t.get("images_loaded"):
+                col.label(text="  %d texture(s) loaded%s"
+                              % (t["images_loaded"],
+                                 (", capped at %d px" % t["max_px"])
+                                 if t.get("max_px") else ""))
+            else:
+                col.label(text="  no texture image loaded", icon="INFO")
+            if t.get("overlay_cells"):
+                col.label(text="  %d sea overlay cell(s)" % t["overlay_cells"])
+            if t.get("uv_layer"):
+                col.label(text="  UVs in %s" % t["uv_layer"])
+            if t.get("terrain_dir"):
+                col.label(text=t["terrain_dir"], icon="FILE_FOLDER")
         sub = lay.column(align=True)
         sub.label(text="vertex coords are metres:", icon="INFO")
         sub.label(text="X east, Y north, Z up")
