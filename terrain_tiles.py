@@ -34,7 +34,10 @@ import os
 
 import numpy as np
 
-import tercodec as TC
+try:                                        # loaded as a Blender addon package
+    from . import tercodec as TC
+except ImportError:                         # run headless as a plain script
+    import tercodec as TC
 
 #: the spherical metres-per-degree constants of tercodec.uv_from_center.  The
 #: footprint and the UV have to use the SAME projection or a face on a cell edge
