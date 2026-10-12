@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Ortho4XP ⇄ Blender 工作流</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--foreground);
+    margin: 0;
+  }
+  .head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%; background: #34d399;
+    animation: pulse 2s infinite; align-self: center; flex: none;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+  h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: -.01em; }
+  .sub { color: var(--muted-foreground); font-size: 11px; margin: 0 0 10px 19px; }
+  .legend {
+    display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
+    font-size: 10px; color: var(--muted-foreground);
+    border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+    padding: 7px 0; margin-bottom: 12px;
+  }
+  .chip { display: inline-flex; align-items: center; gap: 5px; }
+  .sw { width: 13px; height: 9px; border-radius: 2px; border: 1px solid; }
+  .sw.ortho { background: rgba(52,211,153,.18); border-color: #34d399; }
+  .sw.blend { background: rgba(251,146,60,.18); border-color: #fb923c; }
+  .sw.ro { background: transparent; border-color: #94a3b8; border-style: dashed; }
+  .sw.warn { background: rgba(251,113,133,.15); border-color: #fb7185; }
+  svg { display: block; width: 1080px; height: auto; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 14px; }
+  .card { border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 10px 12px; }
+  .card h3 { font-size: 11px; margin: 0 0 6px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .card ul { margin: 0; padding: 0; list-style: none; font-size: 10px; color: var(--muted-foreground); line-height: 1.55; }
+  .cd { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .cd.e { background: #34d399 } .cd.o { background: #fb923c } .cd.r { background: #fb7185 }
+  code { font: inherit; color: var(--foreground); }
+  .foot { color: var(--muted-foreground); font-size: 9px; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<div class="head"><div class="dot"></div><h1>Ortho4XP ⇄ Blender：中间 .mesh 的交接工作流</h1></div>
+<p class="sub">两条泳道 = 两个工具。唯一的交点是一个 ASCII 文件：<code>Data+27+089.mesh</code>。X-Plane 永远不读它。</p>
+
+<div class="legend">
+  <span class="chip"><span class="sw ortho"></span>Ortho4XP（写/读几何）</span>
+  <span class="chip"><span class="sw blend"></span>Blender（编辑）</span>
+  <span class="chip"><span class="sw ro"></span>只读引用</span>
+  <span class="chip"><span class="sw warn"></span>顺序陷阱</span>
+</div>
+
+<svg viewBox="0 0 1080 684" xmlns="http://www.w3.org/2000/svg" role="img"
+     aria-label="Ortho4XP 与 Blender 之间通过 .mesh 中间文件交接的流程图">
+  <defs>
+    <marker id="ag" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#34d399"/>
+    </marker>
+    <marker id="ao" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#fb923c"/>
+    </marker>
+    <marker id="as" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#94a3b8"/>
+    </marker>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="var(--border)" stroke-width=".5" opacity=".35"/>
+    </pattern>
+  </defs>
+
+  <rect width="1080" height="684" fill="url(#grid)"/>
+
+  <!-- ============ arrows first (behind the boxes) ============ -->
+  <!-- A1 -> B1 : the mesh handoff out of Ortho4XP -->
+  <line x1="192" y1="228" x2="192" y2="374" stroke="#34d399" stroke-width="1.6" marker-end="url(#ag)"/>
+  <text x="203" y="272" fill="#34d399" font-size="9" font-weight="600">交接 1 · Step 2 吐出的中间文件</text>
+  <text x="203" y="287" fill="var(--muted-foreground)" font-size="9">Data+27+089.mesh ← 你要编辑的东西</text>
+  <!-- B3 -> A3 : the edited mesh goes back in -->
+  <line x1="888" y1="378" x2="888" y2="232" stroke="#fb923c" stroke-width="1.6" marker-end="url(#ao)"/>
+  <text x="899" y="272" fill="#fb923c" font-size="9" font-weight="600">交接 2 · 同名原地覆盖</text>
+  <text x="899" y="287" fill="var(--muted-foreground)" font-size="9">Step 3 就是靠这个文件重建 DSF</text>
+  <!-- A2 -> A3 : inside step 3 -->
+  <line x1="658" y1="166" x2="762" y2="166" stroke="#34d399" stroke-width="1.6" marker-end="url(#ag)"/>
+  <text x="710" y="158" fill="var(--muted-foreground)" font-size="8.5" text-anchor="middle">同一趟 Step 3</text>
+  <!-- A2 ..> B1 : read-only terrain reference -->
+  <path d="M 520 228 C 520 300, 430 330, 302 372" fill="none" stroke="#94a3b8"
+        stroke-width="1.3" stroke-dasharray="5,4" marker-end="url(#as)"/>
+  <text x="392" y="300" fill="var(--muted-foreground)" font-size="8.5">只读：terrain/*.ter 的</text>
+  <text x="392" y="312" fill="var(--muted-foreground)" font-size="8.5">LOAD_CENTER → 材质 + UV</text>
+  <!-- B1 -> B2 -> B3 -->
+  <line x1="310" y1="442" x2="416" y2="442" stroke="#fb923c" stroke-width="1.6" marker-end="url(#ao)"/>
+  <line x1="658" y1="442" x2="764" y2="442" stroke="#fb923c" stroke-width="1.6" marker-end="url(#ao)"/>
+  <!-- timeline -->
+  <line x1="76" y1="46" x2="700" y2="46" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,4" marker-end="url(#as)"/>
+  <text x="356" y="39" fill="var(--muted-foreground)" font-size="8.5" text-anchor="middle">执行顺序 / 时间轴 →（Ortho4XP 面板按钮的编号）</text>
+
+  <!-- ============ lane A : Ortho4XP ============ -->
+  <rect x="48" y="64" width="984" height="200" rx="12" fill="rgba(52,211,153,.05)"
+        stroke="#34d399" stroke-width="1" stroke-dasharray="8,4" opacity=".9"/>
+  <text x="30" y="164" fill="#34d399" font-size="11" font-weight="700" text-anchor="middle"
+        transform="rotate(-90 30 164)">ORTHO4XP</text>
+
+  <!-- A1 -->
+  <rect x="76" y="104" width="232" height="122" rx="6" fill="var(--card)"/>
+  <rect x="76" y="104" width="232" height="122" rx="6" fill="rgba(52,211,153,.13)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="90" y="128" fill="var(--foreground)" font-size="11" font-weight="600">Step 1 + 2 · create scenery</text>
+  <text x="90" y="152" fill="var(--muted-foreground)" font-size="8.5">O4_Vector_Map.py → O4_Mesh_Utils.py</text>
+  <text x="90" y="168" fill="var(--muted-foreground)" font-size="8.5">Triangulate 3D mesh（Triangle4XP）</text>
+  <text x="90" y="184" fill="var(--muted-foreground)" font-size="8.5">写出 Data+27+089.mesh（225 万顶点）</text>
+  <text x="90" y="208" fill="#34d399" font-size="8">+ .node / .alt / .poly / .apt</text>
+
+  <!-- A2 -->
+  <rect x="426" y="104" width="232" height="122" rx="6" fill="var(--card)"/>
+  <rect x="426" y="104" width="232" height="122" rx="6" fill="rgba(52,211,153,.13)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="440" y="128" fill="var(--foreground)" font-size="11" font-weight="600">Step 3 · Build Imagery</text>
+  <text x="440" y="152" fill="var(--muted-foreground)" font-size="8.5">下载影像 → textures/*.dds（183 张）</text>
+  <text x="440" y="168" fill="var(--muted-foreground)" font-size="8.5">写 terrain/*.ter（231 个）声明每格</text>
+  <text x="440" y="184" fill="var(--muted-foreground)" font-size="8.5">LOAD_CENTER footprint 与贴图路径</text>
+  <text x="440" y="208" fill="#34d399" font-size="8">O4_Tile_Utils.py</text>
+
+  <!-- A3 -->
+  <rect x="776" y="104" width="232" height="122" rx="6" fill="var(--card)"/>
+  <rect x="776" y="104" width="232" height="122" rx="6" fill="rgba(52,211,153,.13)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="790" y="128" fill="var(--foreground)" font-size="11" font-weight="600">Step 3 · Build DSF</text>
+  <text x="790" y="152" fill="var(--muted-foreground)" font-size="8.5">O4_DSF_Utils.py:473</text>
+  <text x="790" y="168" fill="var(--muted-foreground)" font-size="8.5">read_mesh_file(Data+27+089.mesh)</text>
+  <text x="790" y="184" fill="var(--muted-foreground)" font-size="8.5">build_dsf() 合并网格 + 地形</text>
+  <text x="790" y="208" fill="var(--foreground)" font-size="8">→ Earth nav data/+27+089/+27+089.dsf</text>
+
+  <!-- ============ lane B : Blender ============ -->
+  <rect x="48" y="340" width="984" height="200" rx="12" fill="rgba(251,146,60,.05)"
+        stroke="#fb923c" stroke-width="1" stroke-dasharray="8,4" opacity=".9"/>
+  <text x="30" y="440" fill="#fb923c" font-size="11" font-weight="700" text-anchor="middle"
+        transform="rotate(-90 30 440)">BLENDER</text>
+
+  <!-- B1 -->
+  <rect x="76" y="380" width="232" height="122" rx="6" fill="var(--card)"/>
+  <rect x="76" y="380" width="232" height="122" rx="6" fill="rgba(251,146,60,.13)" stroke="#fb923c" stroke-width="1.5"/>
+  <text x="90" y="404" fill="var(--foreground)" font-size="11" font-weight="600">Import .mesh</text>
+  <text x="90" y="428" fill="var(--muted-foreground)" font-size="8.5">File → Import → Ortho4XP Mesh</text>
+  <text x="90" y="444" fill="var(--muted-foreground)" font-size="8.5">ASCII MEDITS：region 位掩码 / 法线</text>
+  <text x="90" y="460" fill="var(--muted-foreground)" font-size="8.5">顺带贴 .ter 影像 → 每格一材质 + UV</text>
+  <text x="90" y="484" fill="#fb923c" font-size="8">看的时候才有贴图，不改 .ter</text>
+
+  <!-- B2 -->
+  <rect x="426" y="380" width="232" height="122" rx="6" fill="var(--card)"/>
+  <rect x="426" y="380" width="232" height="122" rx="6" fill="rgba(251,146,60,.13)" stroke="#fb923c" stroke-width="1.5"/>
+  <text x="440" y="404" fill="var(--foreground)" font-size="11" font-weight="600">Edit</text>
+  <text x="440" y="428" fill="var(--muted-foreground)" font-size="8.5">移动 / 新增顶点：水陆边界、</text>
+  <text x="440" y="444" fill="var(--muted-foreground)" font-size="8.5">跑道压平、海岸线、削平尖刺</text>
+  <text x="440" y="460" fill="var(--muted-foreground)" font-size="8.5">mesh_attr / mesh_normals 随对象存</text>
+  <text x="440" y="484" fill="#fb923c" font-size="8">改的是几何，不是贴图</text>
+
+  <!-- B3 -->
+  <rect x="776" y="380" width="232" height="122" rx="6" fill="var(--card)"/>
+  <rect x="776" y="380" width="232" height="122" rx="6" fill="rgba(251,146,60,.13)" stroke="#fb923c" stroke-width="1.5"/>
+  <text x="790" y="404" fill="var(--foreground)" font-size="11" font-weight="600">Export .mesh</text>
+  <text x="790" y="428" fill="var(--muted-foreground)" font-size="8.5">File → Export → Ortho4XP Mesh</text>
+  <text x="790" y="444" fill="var(--muted-foreground)" font-size="8.5">写回第 4 列 region + nx,ny 法线</text>
+  <text x="790" y="460" fill="var(--muted-foreground)" font-size="8.5">flavour（1.30 / v2）与行尾跟源文件</text>
+  <text x="790" y="484" fill="#fb923c" font-size="8">原地覆盖，文件名必须同瓦片</text>
+
+  <!-- ============ bottom: pitfalls + invariants ============ -->
+  <rect x="48" y="562" width="560" height="100" rx="8" fill="var(--card)"/>
+  <rect x="48" y="562" width="560" height="100" rx="8" fill="rgba(251,113,133,.12)" stroke="#fb7185" stroke-width="1.2"/>
+  <text x="62" y="582" fill="#fb7185" font-size="10" font-weight="700">⚠ 顺序陷阱（两个工具之间）</text>
+  <text x="62" y="600" fill="var(--muted-foreground)" font-size="8.5">① 改完必须跑 Step 3。重跑 Step 1/2 会重新生成 .mesh，编辑全丢。</text>
+  <text x="62" y="615" fill="var(--muted-foreground)" font-size="8.5">② 文件名必须与瓦片一致，Step 3 是按瓦片名去找 Data+27+089.mesh 的。</text>
+  <text x="62" y="630" fill="var(--muted-foreground)" font-size="8.5">③ 官方同款用法：config hint 写明第三方后期处理后要再跑一次 Step 3。</text>
+  <text x="62" y="648" fill="var(--muted-foreground)" font-size="8.5">④ 要试错就先备份（本瓦片目录里就有 Data+27+089.mesh.back）。</text>
+
+  <rect x="632" y="562" width="376" height="100" rx="8" fill="var(--card)"/>
+  <rect x="632" y="562" width="376" height="100" rx="8" fill="rgba(52,211,153,.10)" stroke="#34d399" stroke-width="1.2"/>
+  <text x="646" y="582" fill="#34d399" font-size="10" font-weight="700">.mesh 里 Step 3 依赖的东西</text>
+  <text x="646" y="600" fill="var(--muted-foreground)" font-size="8.5">MeshVersionFormatted 1.30 或 2：build_dsf 按 version≥1.3 分支</text>
+  <text x="646" y="615" fill="var(--muted-foreground)" font-size="8.5">三角第 4 列 region：1=WATER 8=INTERP_ALT 16=RUNWAY 128=HANGAR</text>
+  <text x="646" y="630" fill="var(--muted-foreground)" font-size="8.5">法线只存 nx,ny（z 由 +up 推出）；高度 z 单位 1e5</text>
+  <text x="646" y="648" fill="var(--muted-foreground)" font-size="8.5">顶点是 float32 → 原样往返可字节一致（1.30 的 7 位小数更粗）</text>
+</svg>
+
+<div class="cards">
+  <div class="card">
+    <h3><span class="cd e"></span>交接面：一个纯文本文件</h3>
+    <ul>
+      <li>· <code>Data+27+089.mesh</code>，MEDITS ASCII，逐行一个数字</li>
+      <li>· 225 万顶点 / 449 万三角 ≈ 279 MB；读 10 s、写 15 s 量级</li>
+      <li>· 同目录还有 <code>.ter</code> / <code>textures/</code>，Blender 只读它们显示影像</li>
+      <li>· <code>Earth nav data/…dsf</code> 才是 X-Plane 读的成品</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><span class="cd o"></span>Blender 这一侧的边界</h3>
+    <ul>
+      <li>· 导入时解析 region 位掩码与 nx,ny，导出原样写回</li>
+      <li>· 编辑只改几何；贴图/材质只是参照，不参与导出</li>
+      <li>· 法线在改完顶点后要重算，否则 DSF 里仍是旧法线</li>
+      <li>· 坐标存 float32，所以往返精度约 2 mm 量级（1.30 更粗）</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><span class="cd r"></span>为什么这样做是官方允许的</h3>
+    <ul>
+      <li>· <code>write_mesh_file()</code> 在 Step 2，<code>read_mesh_file()</code> 在 Step 3</li>
+      <li>· 中间文件就是给外部步骤改的：官方 hint 建议影像后期处理后重跑 Step 3</li>
+      <li>· 只要保持格式 flavour 与字段语义，Step 3 完全无感</li>
+      <li>· 好处：改几何不用碰 Ortho4XP 的 Python/tile 配置</li>
+    </ul>
+  </div>
+</div>
+
+<p class="foot">核对来源：O4_Mesh_Utils.py:326 write_mesh_file / :748 调用 · O4_DSF_Utils.py:473 read_mesh_file · O4_Tile_Utils.py:53 Step 3 标签 · O4_Config_Utils.py:60 第三方后期处理 hint</p>
+
+</body>
+</html>
