@@ -15,6 +15,15 @@ symlink it from there, and enable **Ortho4XP Mesh Import/Export** in
 
 ---
 
+## Step by Step 
+
+https://youtu.be/eY7cQnDdXa8
+
+
+## Work Flow
+
+Ortho4XP -> create scenery -> it generates intermediate .mesh file -> Blender import .mesh -> blender Edit -> Blender export to .mesh -> Ortho4XP Build Imagery/DSF to build final DSF
+
 ## What the file is
 
 `.mesh` is Ortho4XP's **intermediate** triangle mesh for one 1×1 degree tile, not a
