@@ -46,7 +46,9 @@ M_PER_DEG_LAT = 111132.92
 M_PER_DEG_LON = 111412.84
 
 __all__ = ["TerCell", "scan_terrain", "find_terrain_dir", "TerrainIndex",
-           "M_PER_DEG_LAT", "M_PER_DEG_LON"]
+           "M_PER_DEG_LAT", "M_PER_DEG_LON",
+           "uv_center", "uv_projected", "cell_uv_affine", "center_uv_affine",
+           "projected_uv_affine"]
 
 
 class TerCell:
@@ -427,3 +429,73 @@ def uv_projected(x_m, y_m, xs, ys, off_x=0.0, off_y=0.0, half_w=0.0, half_h=0.0)
     u = (np.asarray(x_m, dtype=np.float64) + half_w - off_x) / xs
     v = (np.asarray(y_m, dtype=np.float64) + half_h - off_y) / ys
     return u, v
+
+
+def center_uv_affine(cell_lat, cell_lon, cell_size, georef):
+    """(a_x, b_x, a_y, b_y) for one LOAD_CENTER cell, or None.
+
+    The same mapping as :func:`uv_center`, written as a function of the tile's
+    *projected metres* (Blender coordinates, ``X`` east / ``Y`` north of the tile
+    centre) instead of lon/lat::
+
+        u = a_x * x + b_x        v = a_y * y + b_y
+
+    Two consumers need it in that form: the baked UV layer (position -> UV, once)
+    and the material's Z-axis projection (position -> UV, evaluated in the shader,
+    so it survives moving vertices).  Affine rather than a bare scale because a
+    cell is not centred on the tile: its footprint centre is (0.5, 0.5) while the
+    tile centre sits somewhere else.
+
+    The metres-per-degree constants of the two steps do *not* cancel: this works in
+    :func:`uv_center`'s spherical constants (111132.92 m/deg lat, 111412.84 m/deg
+    lon * cos(cell lat)) while `georef` (the geometry) uses DEG*R_EARTH about the
+    tile centre, so the slopes carry the ~0.17% / ~0.1% ratio between the two.
+    Keeping that ratio is what makes the affine reproduce the baked UV exactly
+    instead of approximately.
+    """
+    if cell_lat is None or cell_lon is None or not cell_size:
+        return None
+    mlon_t = float(georef["m_per_deg_lon"])
+    mlat_t = float(georef["m_per_deg_lat"])
+    mlon_c = M_PER_DEG_LON * math.cos(math.radians(float(cell_lat)))
+    size = float(cell_size)
+    return (mlon_c / (size * mlon_t),
+            0.5 + (float(georef["lon0"]) - float(cell_lon)) * mlon_c / size,
+            M_PER_DEG_LAT / (size * mlat_t),
+            0.5 + (float(georef["lat0"]) - float(cell_lat)) * M_PER_DEG_LAT / size)
+
+
+def projected_uv_affine(xs, ys, georef):
+    """(a_x, b_x, a_y, b_y) for a PROJECTED texture, or None."""
+    if not xs or not ys:
+        return None
+    mlon_t = float(georef["m_per_deg_lon"])
+    mlat_t = float(georef["m_per_deg_lat"])
+    hw = (float(georef["east"]) - float(georef["west"])) * 0.5 * mlon_t
+    hh = (float(georef["north"]) - float(georef["south"])) * 0.5 * mlat_t
+    return 1.0 / float(xs), hw / float(xs), 1.0 / float(ys), hh / float(ys)
+
+
+def cell_uv_affine(cells, georef):
+    """Per-cell affine maps for a whole tile.
+
+    Returns ``(a_x, b_x, a_y, b_y, kind)`` as float64 arrays parallel to `cells`,
+    with ``kind`` 0 = no mapping, 1 = LOAD_CENTER footprint, 2 = PROJECTED metres.
+    """
+    n = len(cells)
+    ax = np.zeros(n)
+    bx = np.zeros(n)
+    ay = np.zeros(n)
+    by = np.zeros(n)
+    kind = np.zeros(n, dtype=np.int8)
+    for i, c in enumerate(cells):
+        aff = center_uv_affine(c.lat, c.lon, c.size_m, georef)
+        if aff is not None:
+            ax[i], bx[i], ay[i], by[i] = aff
+            kind[i] = 1
+        elif c.projected:
+            aff = projected_uv_affine(c.projected[0], c.projected[1], georef)
+            if aff is not None:
+                ax[i], bx[i], ay[i], by[i] = aff
+                kind[i] = 2
+    return ax, bx, ay, by, kind

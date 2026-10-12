@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Ortho4XP Mesh Import/Export",
     "author": "built for rourou",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 0, 0),
     "location": "File > Import/Export > Ortho4XP Mesh; View3D > Sidebar > Ortho4XP",
     "description": "Read and write Ortho4XP tile meshes (.mesh) with the tile's "
@@ -104,6 +104,32 @@ Note the consequence for materials: a face has exactly one material slot, so
 "Material slot per triangle attribute" is skipped when textures are imported (the
 `mesh_attr` attribute is written regardless, and still drives the export).
 
+Texture projection (why the texture does not stretch)
+----------------------------------------------------
+Each cell's mapping is an affine map from position to UV, and it is written down
+*rather than* baked into the mesh -- `uv = position * scale + offset`, with the
+position in the object's local metres:
+
+    u = a_x * x + b_x        v = a_y * y + b_y        (terrain_tiles.cell_uv_affine)
+
+Two things consume that map:
+
+  * the material's Z-axis projection: `Texture Coordinate (Object)` -> `Vector Math
+    (Multiply Add)` -> the Vector input of every image texture.  Because the UV is
+    computed from where the surface *is*, dragging a vertex slides the geometry
+    under a texture that stays nailed to the map -- the texture does not stretch,
+    and the view matches what X-Plane renders from the same tile.  Object space,
+    so moving the tile as a whole moves its map with it.
+  * the baked `XPlaneProjected` UV layer, written once at import: the same numbers,
+    for Workbench's solid view, the UV editor and anything else that reads UVs.
+    That layer goes stale when vertices move; the *Projected UVs* button recomputes
+    it from the current positions.
+
+Toggle with the *Fix to map* / *Use UVs* buttons in the sidebar panel, or with
+"Project textures along Z" on import (off = just the baked layer, the pre-1.2
+behaviour).  A rendered view ignores the UV layer entirely, so an edited tile can
+be inspected with the projection before the layer is refreshed.
+
 Round-trip
 ----------
 The triangle attributes and vertex normals are stored on the import (a `mesh_attr`
@@ -130,6 +156,9 @@ from . import terrain_tiles as TT
 
 R_EARTH = 6378137.0          # WGS84 semi-major axis, metres (matches O4_Geo_Utils)
 DEG = math.pi / 180.0
+
+#: node names used by the Z-axis projection, so it can be found and removed again
+ZPROJ_NODES = ("zproj_position", "zproj_uv")
 
 #: name of the UV layer, shared with the DSF addon so both imports look the same
 UV_LAYER = "XPlaneProjected"
@@ -350,11 +379,15 @@ def _cap_image(img, max_px, path=None):
     return False
 
 
-def _store_ter_metadata(mat, cell):
+def _store_ter_metadata(mat, cell, affine=None):
     """Record what the cell's .ter said, so the material stays self-describing.
 
     Kept even when the texture itself is not loaded (see `tex_limit`): the .ter
     path, its texture roles and the mapping parameters are always on the material.
+    `affine` is the cell's position -> UV map (a_x, b_x, a_y, b_y, see
+    `terrain_tiles.cell_uv_affine`); both the Z-axis projection in the node tree
+    and the baked UV layer are built from it, so it is stored as the single
+    source of truth and read back by the *Z projection* / *Projected UVs* buttons.
     """
     mat["mesh_ter_kind"] = "ter"
     mat["mesh_ter_path"] = cell.path
@@ -369,9 +402,105 @@ def _store_ter_metadata(mat, cell):
     mat["mesh_ter_nowrap"] = bool(cell.nowrap)
     if cell.overlay:
         mat["mesh_ter_overlay"] = True
+    if affine is not None:
+        mat["mesh_uv_zproj"] = json.dumps([float(v) for v in affine])
 
 
-def _apply_terrain_texture(mat, cell, max_px=0):
+def _material_affine(mat, georef=None):
+    """The cell's position -> UV map, or None.
+
+    Read from the material (`mesh_uv_zproj`, written at import).  Materials from an
+    import made before the projection existed fall back to `mesh_ter_center` plus
+    the object's `mesh_georef`, which reproduces the same four numbers.
+    """
+    stored = mat.get("mesh_uv_zproj")
+    if stored:
+        try:
+            vals = [float(v) for v in json.loads(stored)]
+            if len(vals) == 4:
+                return tuple(vals)
+        except Exception:                                      # noqa: BLE001
+            pass
+    center = mat.get("mesh_ter_center")
+    if center and georef:
+        try:
+            lat, lon, size = json.loads(center)[:3]
+        except Exception:                                      # noqa: BLE001
+            return None
+        try:
+            return TT.center_uv_affine(lat, lon, size, georef)
+        except Exception:                                      # noqa: BLE001
+            return None
+    return None
+
+
+def _wire_material_zproject(mat, affine):
+    """Feed the material's image textures from a Z-axis projection.
+
+    The texture coordinate is no longer a baked UV loop; it is the *position* of
+    the shading point in the object's local space (metres, X east / Y north, the
+    same coordinates `_geo_to_blender` writes into the vertices), mapped to 0..1
+    over the cell's footprint by one multiply-add::
+
+        uv = position * scale + offset        (a_x, a_y, b_x, b_y)
+
+    Because the UV is a function of where the surface *is*, dragging a vertex in
+    Blender slides the geometry under a texture that stays nailed to the map --
+    which is what X-Plane does with the same tile, and what a baked UV layer
+    cannot do (there the texture is carried along by the vertex and stretches).
+    Object space rather than world space, so moving the tile as a whole moves its
+    map with it.
+
+    Returns True when a chain was wired (or was already there).
+    """
+    if affine is None or mat is None:
+        return False
+    if not mat.use_nodes or mat.node_tree is None:
+        mat.use_nodes = True
+    nt = mat.node_tree
+    if nt is None:
+        return False
+    tex = [nd for nd in nt.nodes if nd.type == "TEX_IMAGE"]
+    if not tex:
+        return False
+    ax, bx, ay, by = (float(v) for v in affine)
+    if ax == 0.0 or ay == 0.0:
+        return False
+    geo = nt.nodes.get(ZPROJ_NODES[0])
+    if geo is None:
+        geo = nt.nodes.new("ShaderNodeTexCoord")
+        geo.name = ZPROJ_NODES[0]
+        geo.label = "Z projection: object position (m)"
+        geo.location = (-1040, 260)
+    # Vector Math "Multiply Add" is componentwise a*b+c in ONE node: scale in
+    # input 1, offset in input 2 -- the whole projection is this multiplication.
+    vm = nt.nodes.get(ZPROJ_NODES[1])
+    if vm is None:
+        vm = nt.nodes.new("ShaderNodeVectorMath")
+        vm.name = ZPROJ_NODES[1]
+        vm.operation = "MULTIPLY_ADD"
+        vm.location = (-820, 260)
+    vm.label = "metres -> UV (fixed map)"
+    vm.inputs[1].default_value = (ax, ay, 0.0)
+    vm.inputs[2].default_value = (bx, by, 0.0)
+    nt.links.new(geo.outputs["Object"], vm.inputs[0])
+    for nd in tex:
+        nt.links.new(vm.outputs["Vector"], nd.inputs["Vector"])
+    return True
+
+
+def _unwire_material_zproject(mat):
+    """Drop the Z projection, putting the image textures back on the UV layer."""
+    if mat is None or not mat.node_tree:
+        return False
+    nt = mat.node_tree
+    gone = [nd for nd in nt.nodes if nd.name in ZPROJ_NODES]
+    for nd in gone:
+        nt.nodes.remove(nd)          # removes its links, so Vector goes back to UV
+    return bool(gone)
+
+
+def _apply_terrain_texture(mat, cell, max_px=0, affine=None, zproj=True):
     """Wire one cell's .ter into a material; returns how many images were loaded.
 
     Same policy as the DSF importer: the base texture drives Base Color, a
@@ -380,7 +509,7 @@ def _apply_terrain_texture(mat, cell, max_px=0):
     the per-vertex factor that lives in the DSF, which a .mesh does not carry, so
     inventing a factor would be a lie.
     """
-    _store_ter_metadata(mat, cell)
+    _store_ter_metadata(mat, cell, affine)
     ter = cell.ter
     mat.use_nodes = True
     nt = mat.node_tree
@@ -434,6 +563,9 @@ def _apply_terrain_texture(mat, cell, max_px=0):
         node.label = role.upper() + "_TEX (imported, not blended)"
         node.image = r_img
         node.extension = extension
+    # ---- the projection that keeps the orthophoto nailed to the map
+    if zproj and affine is not None:
+        _wire_material_zproject(mat, affine)
     # cap the images LAST: the colorspace writes above make Blender re-read each
     # file at its native size, which silently discards an earlier Image.scale()
     if max_px:
@@ -441,6 +573,57 @@ def _apply_terrain_texture(mat, cell, max_px=0):
             if n.type == "TEX_IMAGE" and n.image is not None:
                 _cap_image(n.image, max_px)
     return loaded
+
+
+def _write_uv_layer(me, slot_affine, layer_name=UV_LAYER):
+    """(Re)write the UV layer from the vertices' current positions.
+
+    `uv = position * scale + offset`, per face, taking the mapping from the face's
+    *material slot*: a face keeps its material when its vertices move, so the same
+    call is correct at import and after the tile has been edited -- which is what
+    the *Projected UVs* button uses to re-anchor the layer on the moved geometry.
+
+    This is the baked twin of the shader projection: same four numbers, same
+    coordinates (the object's local metres).  Rendered views use the projection and
+    ignore this layer; Workbench's *solid* view, the UV editor and anything that
+    reads UVs use the layer, and go stale as soon as a vertex is dragged.
+
+    Returns {"layer", "loops", "mapped"}; a missing mapping leaves those loops at 0.
+    """
+    n_poly = len(me.polygons)
+    n_loops = len(me.loops)
+    if not n_poly or not n_loops:
+        return {"layer": None, "loops": 0, "mapped": 0}
+    loop_total = np.empty(n_poly, dtype=np.int32)
+    me.polygons.foreach_get("loop_total", loop_total)
+    slot_of = np.empty(n_poly, dtype=np.int32)
+    me.polygons.foreach_get("material_index", slot_of)
+    loop_vert = np.empty(n_loops, dtype=np.int32)
+    me.loops.foreach_get("vertex_index", loop_vert)
+    co = np.empty(len(me.vertices) * 3, dtype=np.float64)
+    me.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    loop_slot = np.repeat(slot_of, loop_total)
+    u = np.zeros(n_loops)
+    v = np.zeros(n_loops)
+    mapped = 0
+    for slot, affine in enumerate(slot_affine):
+        if affine is None:
+            continue
+        sel = loop_slot == slot
+        if not sel.any():
+            continue
+        ax, bx, ay, by = (float(x) for x in affine)
+        lv = loop_vert[sel]
+        u[sel] = ax * co[lv, 0] + bx
+        v[sel] = ay * co[lv, 1] + by
+        mapped += int(sel.sum())
+    flat = np.empty(n_loops * 2, dtype=np.float32)
+    flat[0::2] = u
+    flat[1::2] = v
+    layer = me.uv_layers.get(layer_name) or me.uv_layers.new(name=layer_name)
+    layer.data.foreach_set("uv", flat)
+    return {"layer": layer.name, "loops": int(n_loops), "mapped": mapped}
 
 
 def _import_terrain_textures(op, obj, me, m, georef):
@@ -484,18 +667,28 @@ def _import_terrain_textures(op, obj, me, m, georef):
     stats["cells_used"] = int(order.size)
     n_load = order.size if not op.tex_limit else min(int(op.tex_limit), order.size)
     load_set = {int(i) for i in order[:n_load]}
+    # position -> UV: one affine per cell, the single source of truth for both the
+    # baked UV layer and the Z projection in the node trees
+    aff = TT.cell_uv_affine(cells, georef)
     slot_of = {}
+    slot_affine = []
     for i in order:
         cell = cells[int(i)]
+        affine = None
+        if aff[4][int(i)]:
+            affine = (float(aff[0][int(i)]), float(aff[1][int(i)]),
+                      float(aff[2][int(i)]), float(aff[3][int(i)]))
         mat = bpy.data.materials.new("ter_%s" % cell.label)
         if int(i) in load_set:
-            n_img = _apply_terrain_texture(mat, cell, int(op.tex_max_px))
+            n_img = _apply_terrain_texture(mat, cell, int(op.tex_max_px), affine,
+                                           bool(op.zproj))
             stats["images_loaded"] += n_img
             if n_img:
                 stats["cells_with_image"] += 1
         else:
-            _store_ter_metadata(mat, cell)
+            _store_ter_metadata(mat, cell, affine)
         slot_of[int(i)] = len(obj.data.materials)
+        slot_affine.append(affine)
         obj.data.materials.append(mat)
 
     # faces with no cell get their own slot, so a gap shows up instead of being
@@ -505,6 +698,7 @@ def _import_terrain_textures(op, obj, me, m, georef):
         gap.diffuse_color = (1.0, 0.15, 0.15, 1.0)
         gap["mesh_ter_kind"] = "none"
         slot_of[-1] = len(obj.data.materials)
+        slot_affine.append(None)
         obj.data.materials.append(gap)
     face_slot = np.zeros(face_cell.size, dtype=np.int32)
     for i in np.unique(face_cell):
@@ -512,72 +706,13 @@ def _import_terrain_textures(op, obj, me, m, georef):
     me.polygons.foreach_set("material_index", face_slot)
     stats["materials"] = len(obj.data.materials)
 
-    # ---- UVs: per loop, computed from the cell that owns the face
-    loop_total = np.empty(len(me.polygons), dtype=np.int32)
-    me.polygons.foreach_get("loop_total", loop_total)
-    loop_vert = np.empty(len(me.loops), dtype=np.int32)
-    me.loops.foreach_get("vertex_index", loop_vert)
-    loop_cell = np.repeat(face_cell, loop_total)
-    co = np.empty(len(me.vertices) * 3, dtype=np.float64)
-    me.vertices.foreach_get("co", co)
-    co = co.reshape(-1, 3)
-    lat_l = georef["lat0"] + co[loop_vert, 1] / georef["m_per_deg_lat"]
-    lon_l = georef["lon0"] + co[loop_vert, 0] / georef["m_per_deg_lon"]
-    u = np.zeros(lat_l.size)
-    v = np.zeros(lat_l.size)
-
-    valid = loop_cell >= 0
-    lc = loop_cell[valid]
-    if lc.size:
-        n_cells = len(cells)
-        c_lat = np.zeros(n_cells)
-        c_lon = np.zeros(n_cells)
-        c_size = np.ones(n_cells)
-        c_center = np.zeros(n_cells, dtype=bool)
-        c_xs = np.ones(n_cells)
-        c_ys = np.ones(n_cells)
-        c_ox = np.zeros(n_cells)
-        c_oy = np.zeros(n_cells)
-        c_proj = np.zeros(n_cells, dtype=bool)
-        for i, c in enumerate(cells):
-            if c.lat is not None:
-                c_lat[i], c_lon[i] = c.lat, c.lon
-                c_size[i] = c.size_m or 1.0
-                c_center[i] = True
-            if c.projected:
-                c_proj[i] = True
-                c_xs[i], c_ys[i] = c.projected[0], c.projected[1]
-        hw = (georef["east"] - georef["west"]) * 0.5 * georef["m_per_deg_lon"]
-        hh = (georef["north"] - georef["south"]) * 0.5 * georef["m_per_deg_lat"]
-        llat = lat_l[valid]
-        llon = lon_l[valid]
-        uu = np.zeros(lc.size)
-        vv = np.zeros(lc.size)
-        center = c_center[lc]
-        if np.any(center):
-            uu[center], vv[center] = TT.uv_center(
-                c_lat[lc[center]], c_lon[lc[center]], c_size[lc[center]],
-                llat[center], llon[center])
-        proj = c_proj[lc] & ~center
-        if np.any(proj):
-            lv = loop_vert[valid][proj]
-            uu[proj], vv[proj] = TT.uv_projected(
-                co[lv, 0], co[lv, 1], c_xs[lc[proj]], c_ys[lc[proj]],
-                c_ox[lc[proj]], c_oy[lc[proj]], hw, hh)
-        uv_skip = int(np.count_nonzero(~(center | proj)))
-        if uv_skip:
-            print("[Ortho4XP mesh import] %d loop(s) on faces whose .ter has neither "
-                  "LOAD_CENTER nor PROJECTED: UVs left at 0" % uv_skip)
-        u[valid] = uu
-        v[valid] = vv
-
-    flat = np.empty(lat_l.size * 2, dtype=np.float32)
-    flat[0::2] = u
-    flat[1::2] = v
-    layer = me.uv_layers.get(UV_LAYER) or me.uv_layers.new(name=UV_LAYER)
-    layer.data.foreach_set("uv", flat)
-    obj["mesh_uv_layer"] = layer.name
-    stats["uv_layer"] = layer.name
+    # ---- UVs: the same map, baked once from the vertices' positions
+    uv_stats = _write_uv_layer(me, slot_affine)
+    obj["mesh_uv_layer"] = uv_stats["layer"]
+    stats["uv_layer"] = uv_stats["layer"]
+    stats["uv_loops"] = uv_stats["loops"]
+    stats["uv_mapped"] = uv_stats["mapped"]
+    stats["zproj"] = bool(op.zproj)
     # verify the memory cap instead of trusting it: report any image still over it
     if int(op.tex_max_px or 0):
         over = [i.name for i in bpy.data.images
@@ -658,6 +793,16 @@ class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
     smooth: BoolProperty(
         name="Smooth shading",
         description="Shade the tile smooth (terrain looks faceted otherwise)",
+        default=True,
+    )
+    zproj: BoolProperty(
+        name="Project textures along Z (fixed map)",
+        description="Feed every texture from a Z-axis projection of the vertex "
+                    "positions instead of the baked UV layer, so the orthophoto "
+                    "stays nailed to the map while you drag vertices around -- the "
+                    "same thing X-Plane does with the same tile. The UV layer is "
+                    "still written (Workbench's solid view and other tools read it) "
+                    "and can be re-anchored with 'Projected UVs' after editing",
         default=True,
     )
     report_extra: BoolProperty(
@@ -772,6 +917,7 @@ class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
         })
         if tex_stats is not None:
             obj["mesh_tex_stats"] = json.dumps(tex_stats)
+        obj["mesh_zproj"] = bool(tex_stats and self.zproj)
         obj["mesh_source"] = self.filepath
         obj["mesh_unit_scale"] = 1.0        # Blender units are metres here
 
@@ -1071,6 +1217,94 @@ class EXPORT_OT_ortho4xp_mesh(bpy.types.Operator, ExportHelper):
         return {"FINISHED"}
 
 
+# --------------------------------------------------------------- projection
+def _georef_of(obj):
+    raw = obj.get("mesh_georef")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def _tile_targets(context):
+    """Tile objects the projection buttons act on: imported tiles, else selection."""
+    objs = _tile_objects(context, False)
+    if objs:
+        return objs
+    return [o for o in context.selected_objects
+            if o.type == "MESH" and o.data and len(o.data.polygons)]
+
+
+def _slot_affines(obj):
+    """One (a_x, b_x, a_y, b_y) or None per material slot of the object."""
+    g = _georef_of(obj)
+    return [(_material_affine(s.material, g) if s.material else None)
+            for s in obj.material_slots]
+
+
+class MESH_OT_zproject(bpy.types.Operator):
+    """Add or remove the Z-axis texture projection in the tile's materials"""
+    bl_idname = "mesh.ortho4xp_zproject"
+    bl_label = "Z-axis projection"
+    bl_description = ("Feed the tile's textures from a Z-axis projection of the "
+                      "vertex positions (fixed map) or put them back on the baked "
+                      "UV layer")
+    bl_options = {"UNDO"}
+
+    enable: BoolProperty(name="Enable", default=True)
+
+    def execute(self, context):
+        objs = _tile_targets(context)
+        if not objs:
+            self.report({"WARNING"}, "No Ortho4XP tile mesh to project")
+            return {"CANCELLED"}
+        mats = 0
+        for obj in objs:
+            aff = _slot_affines(obj)
+            for slot, s in enumerate(obj.material_slots):
+                mat = s.material
+                if mat is None:
+                    continue
+                if self.enable:
+                    if _wire_material_zproject(mat, aff[slot]):
+                        mats += 1
+                elif _unwire_material_zproject(mat):
+                    mats += 1
+            obj["mesh_zproj"] = bool(self.enable)
+        self.report({"INFO"}, "%s the Z projection on %d material(s) of %d tile(s)"
+                    % ("Enabled" if self.enable else "Removed", mats, len(objs)))
+        return {"FINISHED"}
+
+
+class MESH_OT_reproject_uvs(bpy.types.Operator):
+    """Re-anchor the UV layer on the vertices' current positions"""
+    bl_idname = "mesh.ortho4xp_reproject_uvs"
+    bl_label = "Projected UVs"
+    bl_description = ("Recompute the XPlaneProjected UV layer from where the "
+                      "vertices are now (uv = position * scale + offset, per cell). "
+                      "Rendered views use the Z projection and do not need this; "
+                      "Workbench's solid view, the UV editor and anything else "
+                      "reading the UV layer do, after geometry has been moved")
+    bl_options = {"UNDO"}
+
+    def execute(self, context):
+        objs = _tile_targets(context)
+        if not objs:
+            self.report({"WARNING"}, "No Ortho4XP tile mesh to reproject")
+            return {"CANCELLED"}
+        loops = 0
+        for obj in objs:
+            stats = _write_uv_layer(obj.data, _slot_affines(obj))
+            loops += stats["mapped"]
+            if stats["layer"]:
+                obj["mesh_uv_layer"] = stats["layer"]
+        self.report({"INFO"}, "Reprojected %d UV loop(s) on %d tile(s)"
+                    % (loops, len(objs)))
+        return {"FINISHED"}
+
+
 # --------------------------------------------------------------- panel
 class MESH_PT_ortho4xp_panel(bpy.types.Panel):
     bl_label = "Ortho4XP Mesh"
@@ -1135,9 +1369,20 @@ class MESH_PT_ortho4xp_panel(bpy.types.Panel):
             if t.get("overlay_cells"):
                 col.label(text="  %d sea overlay cell(s)" % t["overlay_cells"])
             if t.get("uv_layer"):
-                col.label(text="  UVs in %s" % t["uv_layer"])
+                col.label(text="  UVs in %s (%s of %s loop(s))"
+                              % (t["uv_layer"], "{:,}".format(t.get("uv_mapped", 0)),
+                                 "{:,}".format(t.get("uv_loops", 0))))
             if t.get("terrain_dir"):
                 col.label(text=t["terrain_dir"], icon="FILE_FOLDER")
+        proj = box.column(align=True)
+        proj.label(text="texture projection:", icon="TEXTURE")
+        proj.label(text="  %s"
+                   % ("Z axis, fixed on the map" if obj.get("mesh_zproj")
+                      else "baked UV layer"))
+        row = proj.row(align=True)
+        row.operator(MESH_OT_zproject.bl_idname, text="Fix to map").enable = True
+        row.operator(MESH_OT_zproject.bl_idname, text="Use UVs").enable = False
+        proj.operator(MESH_OT_reproject_uvs.bl_idname, icon="UV")
         sub = lay.column(align=True)
         sub.label(text="vertex coords are metres:", icon="INFO")
         sub.label(text="X east, Y north, Z up")
@@ -1145,7 +1390,7 @@ class MESH_PT_ortho4xp_panel(bpy.types.Panel):
 
 # --------------------------------------------------------------- registration
 CLASSES = (IMPORT_OT_ortho4xp_mesh, EXPORT_OT_ortho4xp_mesh,
-           MESH_PT_ortho4xp_panel)
+           MESH_OT_zproject, MESH_OT_reproject_uvs, MESH_PT_ortho4xp_panel)
 
 
 def _menu_import(self, context):
