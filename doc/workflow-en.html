@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ortho4XP ↔ Blender workflow</title>
+<style>
+  * { box-sizing: border-box; }
+  body { color: var(--foreground); margin: 0; }
+  .head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: #34d399; animation: pulse 2s infinite; flex: none; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+  h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -.01em; }
+  .sub { color: var(--muted-foreground); font-size: 14px; margin: 0 0 16px 21px; line-height: 1.5; max-width: 1050px; }
+  svg { display: block; width: 1200px; height: auto; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+
+<div class="head"><div class="dot"></div><h1>Ortho4XP ↔ Blender workflow</h1></div>
+<p class="sub">Two tools, two lanes. They meet over one file: the intermediate <span class="mono">.mesh</span>. X-Plane never reads it — it only reads the final <span class="mono">.dsf</span>.</p>
+
+<svg viewBox="0 0 1200 600" xmlns="http://www.w3.org/2000/svg" role="img"
+     aria-label="Ortho4XP and Blender exchanging an intermediate mesh file">
+  <defs>
+    <marker id="ag" markerWidth="11" markerHeight="9" refX="10" refY="4.5" orient="auto">
+      <polygon points="0 0, 11 4.5, 0 9" fill="#34d399"/>
+    </marker>
+    <marker id="ao" markerWidth="11" markerHeight="9" refX="10" refY="4.5" orient="auto">
+      <polygon points="0 0, 11 4.5, 0 9" fill="#fb923c"/>
+    </marker>
+    <marker id="as" markerWidth="11" markerHeight="9" refX="10" refY="4.5" orient="auto">
+      <polygon points="0 0, 11 4.5, 0 9" fill="#94a3b8"/>
+    </marker>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="var(--border)" stroke-width=".5" opacity=".3"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="600" fill="url(#grid)"/>
+
+  <!-- order of execution -->
+  <line x1="200" y1="50" x2="1000" y2="50" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="5,5" marker-end="url(#as)"/>
+  <text x="600" y="39" fill="var(--muted-foreground)" font-size="12" text-anchor="middle">the order you run things</text>
+
+  <!-- hand-off arrows (behind the boxes) -->
+  <line x1="300" y1="222" x2="300" y2="328" stroke="#34d399" stroke-width="2" marker-end="url(#ag)"/>
+  <text x="318" y="278" fill="#34d399" font-size="13" font-weight="650">hand&#8209;off 1 · the .mesh</text>
+  <text x="318" y="298" fill="var(--muted-foreground)" font-size="12">you edit this file</text>
+
+  <line x1="900" y1="328" x2="900" y2="226" stroke="#fb923c" stroke-width="2" marker-end="url(#ao)"/>
+  <text x="918" y="278" fill="#fb923c" font-size="13" font-weight="650">hand&#8209;off 2 · same file</text>
+  <text x="918" y="298" fill="var(--muted-foreground)" font-size="12">overwritten in place</text>
+
+  <!-- ============ Ortho4XP lane ============ -->
+  <rect x="64" y="74" width="1080" height="180" rx="12" fill="rgba(52,211,153,.05)" stroke="#34d399" stroke-width="1" stroke-dasharray="8,4"/>
+  <text x="40" y="164" fill="#34d399" font-size="15" font-weight="700" text-anchor="middle" transform="rotate(-90 40 164)" letter-spacing=".5">ORTHO4XP</text>
+
+  <rect x="170" y="106" width="260" height="116" rx="6" fill="var(--card)"/>
+  <rect x="170" y="106" width="260" height="116" rx="6" fill="rgba(52,211,153,.13)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="185" y="136" fill="var(--foreground)" font-size="15" font-weight="650">Create scenery</text>
+  <text x="185" y="162" fill="var(--muted-foreground)" font-size="12.5">Step 1–2 · builds the terrain,</text>
+  <text x="185" y="182" fill="var(--muted-foreground)" font-size="12.5">writes the intermediate mesh</text>
+  <text x="185" y="207" fill="#34d399" font-size="12" class="mono">Data+27+089.mesh</text>
+
+  <rect x="770" y="106" width="260" height="116" rx="6" fill="var(--card)"/>
+  <rect x="770" y="106" width="260" height="116" rx="6" fill="rgba(52,211,153,.13)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="785" y="136" fill="var(--foreground)" font-size="15" font-weight="650">Build Imagery + DSF</text>
+  <text x="785" y="162" fill="var(--muted-foreground)" font-size="12.5">Step 3 · reads that mesh,</text>
+  <text x="785" y="182" fill="var(--muted-foreground)" font-size="12.5">adds textures, writes the .dsf</text>
+  <text x="785" y="207" fill="#34d399" font-size="12" class="mono">+27+089.dsf → X-Plane</text>
+
+  <!-- ============ Blender lane ============ -->
+  <rect x="64" y="304" width="1080" height="180" rx="12" fill="rgba(251,146,60,.05)" stroke="#fb923c" stroke-width="1" stroke-dasharray="8,4"/>
+  <text x="40" y="394" fill="#fb923c" font-size="15" font-weight="700" text-anchor="middle" transform="rotate(-90 40 394)" letter-spacing=".5">BLENDER</text>
+
+  <rect x="170" y="336" width="260" height="116" rx="6" fill="var(--card)"/>
+  <rect x="170" y="336" width="260" height="116" rx="6" fill="rgba(251,146,60,.13)" stroke="#fb923c" stroke-width="1.5"/>
+  <text x="185" y="366" fill="var(--foreground)" font-size="15" font-weight="650">Import mesh</text>
+  <text x="185" y="392" fill="var(--muted-foreground)" font-size="12.5">the terrain arrives as editable</text>
+  <text x="185" y="412" fill="var(--muted-foreground)" font-size="12.5">geometry in your scene</text>
+  <text x="185" y="437" fill="#fb923c" font-size="12">orthophotos optional, for context</text>
+
+  <rect x="470" y="336" width="260" height="116" rx="6" fill="var(--card)"/>
+  <rect x="470" y="336" width="260" height="116" rx="6" fill="rgba(251,146,60,.13)" stroke="#fb923c" stroke-width="1.5"/>
+  <text x="485" y="366" fill="var(--foreground)" font-size="15" font-weight="650">Edit terrain</text>
+  <text x="485" y="392" fill="var(--muted-foreground)" font-size="12.5">move vertices: lakes, runways,</text>
+  <text x="485" y="412" fill="var(--muted-foreground)" font-size="12.5">coastlines, rough patches</text>
+  <text x="485" y="437" fill="#fb923c" font-size="12">nothing else is touched</text>
+
+  <rect x="770" y="336" width="260" height="116" rx="6" fill="var(--card)"/>
+  <rect x="770" y="336" width="260" height="116" rx="6" fill="rgba(251,146,60,.13)" stroke="#fb923c" stroke-width="1.5"/>
+  <text x="785" y="366" fill="var(--foreground)" font-size="15" font-weight="650">Export mesh</text>
+  <text x="785" y="392" fill="var(--muted-foreground)" font-size="12.5">writes your changes back</text>
+  <text x="785" y="412" fill="var(--muted-foreground)" font-size="12.5">into the same file</text>
+  <text x="785" y="437" fill="#fb923c" font-size="12" class="mono">keep the file name</text>
+
+  <!-- ============ one warning strip ============ -->
+  <rect x="64" y="512" width="1080" height="64" rx="8" fill="var(--card)"/>
+  <rect x="64" y="512" width="1080" height="64" rx="8" fill="rgba(251,113,133,.12)" stroke="#fb7185" stroke-width="1.2"/>
+  <text x="86" y="538" fill="#fb7185" font-size="13.5" font-weight="650">⚠ After editing, run Step 3 — and never re-run Step 1–2.</text>
+  <text x="86" y="562" fill="var(--muted-foreground)" font-size="12.5">Step 1–2 rebuilds the mesh from scratch, which throws your edits away. Back the file up if you want to experiment.</text>
+</svg>
+
+</body>
+</html>
