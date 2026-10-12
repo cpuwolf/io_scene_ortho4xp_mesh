@@ -284,23 +284,25 @@ def find_terrain_dir(mesh_path, extra_dirs=()):
 
 
 class TerrainIndex:
-    """Spatial index over terrain cells: point -> containing cell.
+    """Spatial index over terrain cells: point -> the cell that textures it.
 
-    Bins the tile on the finest cell size present (Ortho4XP tiles mix zoom levels,
-    e.g. ZL17 with ZL19 patches), fills each cell's bins, then maps every query
-    point to the **finest cell that actually contains it**, searching the bin plus
-    its neighbours.
+    Bins the tile at the finest cell size present (Ortho4XP tiles mix zoom levels,
+    e.g. ZL17 with ZL19 patches) and registers every cell in every bin its
+    footprint touches, so a query only has to look at its own bin: a cell that
+    covers a point necessarily overlaps the bin that point falls in.
 
-    Why the neighbourhood search: a patch of a finer zoom level clips the bins at
-    its border, so the bin a point falls in may be assigned to a fine cell that
-    does not contain the point at all.  Taking that assignment on trust loses a
-    band up to a kilometre wide along every patch border (measured: 17% of a real
-    tile's faces), so candidates from the surrounding bins are tested and the
-    smallest (finest) containing cell wins.
+    Why a candidate list rather than one cell per bin: a finer patch clips the bins
+    along its border, so the bin a point falls in can be owned by a fine cell that
+    does not contain the point.  Keeping only the finest writer drops the coarse
+    cell underneath it, and with it every face in the part of the bin the fine
+    patch does not reach -- measured on a real tile: 637 faces (0.03%) and 5 cells
+    whose texture was therefore never used at all.
+
+    Candidates are ordered finest first, and for equal sizes the `_sea_overlay.ter`
+    ahead of a plain `.ter` of the same footprint (the definition Ortho4XP's own DSF
+    references for those cells), so the first candidate that really contains the
+    point is the answer.
     """
-
-    #: bin radius searched around the point's own bin
-    REACH = 2
 
     def __init__(self, cells):
         self.cells = list(cells)
@@ -308,6 +310,7 @@ class TerrainIndex:
         if not usable:
             raise ValueError("no terrain cell has a LOAD_CENTER footprint")
         self.sizes = np.array([c.size_m or 0.0 for c in self.cells])
+        self.is_overlay = np.array([bool(c.overlay) for c in self.cells], dtype=bool)
         self.c_lat0 = np.array([c.lat0 if c.lat is not None else 1e9
                                 for c in self.cells])
         self.c_lat1 = np.array([c.lat1 if c.lat is not None else -1e9
@@ -328,32 +331,42 @@ class TerrainIndex:
         self.dlat = (self.lat_max - self.lat_min + 2 * dlat) / self.ny
         self.lon0 = self.lon_min - dlon
         self.lat0 = self.lat_min - dlat
-        self.grid = np.full(self.nx * self.ny, -1, dtype=np.int32)
-        view = self.grid.reshape(self.ny, self.nx)
-        # coarse cells first so that finer (higher zoom) cells overwrite them
-        for idx in sorted(range(len(self.cells)),
-                          key=lambda i: -(self.cells[i].size_m or 0)):
-            c = self.cells[idx]
+        # register every cell in every bin its footprint touches; each bin keeps an
+        # ordered candidate list (finest first, sea overlay ahead of a plain cell)
+        bins = [[] for _ in range(self.nx * self.ny)]
+        for i, c in enumerate(self.cells):
             if c.lat is None:
                 continue
             x0 = max(0, int((c.lon0 - self.lon0) / self.dlon))
             x1 = min(self.nx, int((c.lon1 - self.lon0) / self.dlon) + 1)
             y0 = max(0, int((c.lat0 - self.lat0) / self.dlat))
             y1 = min(self.ny, int((c.lat1 - self.lat0) / self.dlat) + 1)
-            if x1 > x0 and y1 > y0:
-                view[y0:y1, x0:x1] = idx
+            for by in range(y0, max(y0, y1)):
+                base = by * self.nx
+                for bx in range(x0, max(x0, x1)):
+                    bins[base + bx].append(i)
+        self.max_cand = 1
+        for items in bins:
+            items.sort(key=lambda i: (self.sizes[i],
+                                      0 if self.is_overlay[i] else 1, i))
+            self.max_cand = max(self.max_cand, len(items))
+        self.bin_cells = np.full((len(bins), self.max_cand), -1, dtype=np.int32)
+        for b, items in enumerate(bins):
+            self.bin_cells[b, :len(items)] = items
 
     def _bins(self, lat, lon):
         bx = np.floor((lon - self.lon0) / self.dlon).astype(np.int64)
         by = np.floor((lat - self.lat0) / self.dlat).astype(np.int64)
         return np.clip(bx, 0, self.nx - 1), np.clip(by, 0, self.ny - 1)
 
-    def lookup(self, lat, lon, exact=True, chunk=250000):
+    def lookup(self, lat, lon, exact=True, chunk=65536):
         """Per-point cell index (-1 = no cell covers this point).
 
-        With ``exact=False`` the point's own bin is taken at face value (fast, and
-        what the fill order implies); with ``exact=True`` the surrounding bins are
-        searched for the finest cell that really contains the point.
+        ``exact=True`` tests containment against every candidate in the point's bin
+        and returns the finest cell that really contains it.  ``exact=False`` takes
+        the bin's first candidate at face value -- faster, but it can name a cell
+        that does not contain the point (the fine-patch border case the candidate
+        order exists for), so it is only for previews.
         """
         lat = np.asarray(lat, dtype=np.float64)
         lon = np.asarray(lon, dtype=np.float64)
@@ -361,34 +374,25 @@ class TerrainIndex:
         la = lat.ravel()
         lo = lon.ravel()
         out = np.full(la.size, -1, dtype=np.int32)
+        rows = np.arange(chunk)
         for start in range(0, la.size, chunk):
             sl = slice(start, min(start + chunk, la.size))
             y = la[sl]
             x = lo[sl]
             bx, by = self._bins(y, x)
+            cand = self.bin_cells[by * self.nx + bx]          # (n, max_cand)
             if not exact:
-                out[sl] = self.grid[by * self.nx + bx]
+                out[sl] = cand[:, 0]
                 continue
-            best = np.full(y.size, np.inf)
-            best_idx = np.full(y.size, -1, dtype=np.int32)
-            r = self.REACH
-            for dy in range(-r, r + 1):
-                yy = np.clip(by + dy, 0, self.ny - 1)
-                for dx in range(-r, r + 1):
-                    xx = np.clip(bx + dx, 0, self.nx - 1)
-                    cand = self.grid[yy * self.nx + xx]
-                    if not np.any(cand >= 0):
-                        continue
-                    ci = np.where(cand >= 0, cand, 0)
-                    inside = ((cand >= 0)
-                              & (y >= self.c_lat0[ci]) & (y <= self.c_lat1[ci])
-                              & (x >= self.c_lon0[ci]) & (x <= self.c_lon1[ci]))
-                    size = np.where(cand >= 0, self.sizes[ci], np.inf)
-                    better = inside & (size < best)
-                    if np.any(better):
-                        best = np.where(better, size, best)
-                        best_idx = np.where(better, cand, best_idx)
-            out[sl] = best_idx
+            ci = np.where(cand >= 0, cand, 0)
+            ok = cand >= 0
+            ok &= (y[:, None] >= self.c_lat0[ci]) & (y[:, None] <= self.c_lat1[ci])
+            ok &= (x[:, None] >= self.c_lon0[ci]) & (x[:, None] <= self.c_lon1[ci])
+            hit = ok.any(axis=1)
+            if hit.any():
+                # candidates are pre-sorted finest-first, so the first hit wins
+                pick = np.argmax(ok[hit], axis=1)
+                out[sl] = np.where(hit, cand[rows[:y.size][hit], pick], -1)
         return out.reshape(shape)
 
     def centroid_cells(self, lat, lon, tris):
