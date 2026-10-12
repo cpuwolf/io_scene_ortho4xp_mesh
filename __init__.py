@@ -304,20 +304,50 @@ def _load_image(path, max_px=0):
               % (os.path.basename(path), ex))
         return None
     if max_px:
+        _cap_image(img, max_px, path)
+    return img
+
+
+def _cap_image(img, max_px, path=None):
+    """Enforce `max_px` on an image, and verify that it actually took.
+
+    Writing to `img.colorspace_settings.name` -- even to the value it already has --
+    invalidates the ImBuf and makes Blender re-read the file at its native size,
+    which silently discards an earlier `Image.scale()`.  The cap therefore has to be
+    applied *after* the material wiring and then checked.  A decode is tried as a
+    second route, because `scale()` on a never-decoded image is a no-op on some
+    builds.  Returns True when the image ends up within the cap.
+    """
+    if not max_px or img is None:
+        return True
+    if path is None:
+        path = img.filepath
+    for attempt in (1, 2):
         w, h = img.size
         if not (w and h):
             w, h = _file_dimensions(path) or (0, 0)
-        if max(w, h) > max_px:
-            s = max_px / float(max(w, h))
+        if max(w, h) <= max_px:
+            return True
+        if attempt == 2:
             try:
-                img.scale(max(1, int(round(w * s))), max(1, int(round(h * s))))
+                _ = img.pixels[0]                  # decode so scale() has a buffer
             except Exception as ex:                            # noqa: BLE001
-                print("[Ortho4XP mesh import] cannot scale %s: %s" % (img.name, ex))
-        if max(img.size) > max_px:
-            print("[Ortho4XP mesh import] %s stayed at %s (%sx%s) -- this Blender "
-                  "build would not downscale it"
-                  % (os.path.basename(path), tuple(img.size), w, h))
-    return img
+                print("[Ortho4XP mesh import] cannot decode %s: %s"
+                      % (os.path.basename(path), ex))
+                return False
+            w, h = img.size or (w, h)
+        scale = max_px / float(max(w, h))
+        try:
+            img.scale(max(1, int(round(w * scale))),
+                      max(1, int(round(h * scale))))
+        except Exception as ex:                                # noqa: BLE001
+            print("[Ortho4XP mesh import] cannot scale %s: %s"
+                  % (os.path.basename(path), ex))
+            return False
+    print("[Ortho4XP mesh import] %s is still %s after downscaling: this Blender "
+          "build will not hold the %d px cap for it"
+          % (os.path.basename(path), tuple(img.size), max_px))
+    return False
 
 
 def _store_ter_metadata(mat, cell):
@@ -404,6 +434,12 @@ def _apply_terrain_texture(mat, cell, max_px=0):
         node.label = role.upper() + "_TEX (imported, not blended)"
         node.image = r_img
         node.extension = extension
+    # cap the images LAST: the colorspace writes above make Blender re-read each
+    # file at its native size, which silently discards an earlier Image.scale()
+    if max_px:
+        for n in nt.nodes:
+            if n.type == "TEX_IMAGE" and n.image is not None:
+                _cap_image(n.image, max_px)
     return loaded
 
 
@@ -542,6 +578,16 @@ def _import_terrain_textures(op, obj, me, m, georef):
     layer.data.foreach_set("uv", flat)
     obj["mesh_uv_layer"] = layer.name
     stats["uv_layer"] = layer.name
+    # verify the memory cap instead of trusting it: report any image still over it
+    if int(op.tex_max_px or 0):
+        over = [i.name for i in bpy.data.images
+                if i.source == "FILE" and max(i.size) > int(op.tex_max_px)]
+        stats["images_over_cap"] = len(over)
+        if over:
+            print("[Ortho4XP mesh import] WARNING: %d image(s) are still above the "
+                  "%d px cap: %s" % (len(over), int(op.tex_max_px), over[:5]))
+    else:
+        stats["images_over_cap"] = 0
     return stats
 
 

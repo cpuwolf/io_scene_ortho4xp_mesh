@@ -114,10 +114,12 @@ Details that matter on real tiles:
   keeps the area up to the midline between it and its same-zoom-level neighbours,
   which tiles exactly, and the cells are layered coarse → fine so a ZL19 patch
   overwrites the ZL17 grid beneath it.
-* **Assignment searches the bin neighbourhood** (a 5×5 grid of bins around the
-  point, taking the finest cell that *really* contains it). Trusting the point's own
-  bin alone loses a band up to ~1 km wide wherever a fine patch clips a bin it does
-  not actually cover.
+* **Each bin keeps every cell whose footprint touches it**, and the assignment takes
+  the finest of those that *really* contains the point. Keeping only the finest cell
+  per bin (the first version) silently drops the coarse cell underneath a fine
+  patch: on `+27+089` that stranded 637 faces in bins owned by ZL19 cells that did
+  not contain them, and left the 5 ZL18 cells underneath used by no face at all, so
+  their textures never reached Blender.
 * **`_sea_overlay.ter` wins** over the plain `.ter` with the same footprint, because
   that is the definition Ortho4XP's own DSF uses for those cells (the overlay adds
   `WET`, `NO_SHADOW` and a border mask).
@@ -137,23 +139,31 @@ There is no cheap way to display 1000 orthophotos at once, so both knobs are
 explicit:
 
 * **Blender loads lazily.** `bpy.data.images.load()` alone costs ~0.4 MB per image
-  (measured); pixels are decoded only when something displays them. The default
-  (`tex_max_px = 0`) therefore loads every cell's image and lets Blender decide —
-  cheap at import time, but viewing the whole tile decodes ~1000 images at
-  **~250 MB each**.
+  (measured); pixels are decoded only when something displays them, so importing all
+  707 cells is cheap. Displaying the *whole* tile is what costs: a Workbench render
+  of every cell's orthophoto measured **11.9 GB peak RSS** (macOS
+  `maximum resident set size`), while a single full-resolution decode of one
+  4096×2560 DXT image costs ~248 MB on its own — Blender evidently keeps a reduced
+  copy per displayed texture rather than 707 full decodes.
 * **`tex_limit`** (default 0 = all) loads images for at most N cells, the ones
   owning the most faces first. Materials, `.ter` metadata and UVs are created for
   *every* used cell either way; only the image is skipped, so nothing is lost.
 * **`tex_max_px`** decodes and downscales each image to at most N pixels: a
-  4096×2560 orthophoto dropped to 1024×640 costs ~5 MB instead of ~250 MB
-  (measured), which is what makes a whole-tile view practical.
+  4096×2560 orthophoto dropped to 1024×640 costs ~5 MB instead of ~248 MB
+  (measured), which is what makes a whole-tile view practical. It is a quality
+  trade-off, not free: at 1024 px a 1085 m ZL19 cell is ~1 m/px, and a close-up
+  rendered at that scale aliases badly (measured: the same 1200×1200 view of a
+  4096 px cell is crisp at native size and shows heavy horizontal moiré at 1024).
+  Use 0 — or a higher cap — when inspecting detail, a small cap when viewing a
+  whole tile.
 
-> **Known issue:** some DDS files report size `(0, 0)` to Blender until their pixels
-> are touched. The cap reads the header itself in that case, but on part of those
-> files `Image.scale()` still does not take effect, so some images can stay at
-> native size without a warning. Until that is fixed, treat `tex_max_px` as
-> best-effort rather than as a hard memory limit, and check the sidebar's
-> loaded-image count.
+> **Why the cap needs care:** writing `img.colorspace_settings.name` — *even to the
+> value it already has* — invalidates Blender's ImBuf and makes it re-read the file
+> at native size, silently discarding an earlier `Image.scale()` (measured: a 4096²
+> DDS → scale to 1024 → set sRGB → back to 4096). The cap is therefore applied
+> **after** the material wiring and then verified: the importer reports
+> `images_over_cap` in its stats and warns if an image could not be brought down, and
+> a whole-tile Workbench render leaves every image at or below the cap.
 
 `base` textures drive Base Color, a `NORMAL_TEX` gets a normal-map node, and the
 remaining layers (`lit`, `composite`, `border`) are imported as labelled but
@@ -210,22 +220,35 @@ python3 verify/verify_mesh_format.py [mesh_file] [--repo /path/to/Ortho4XP]
 blender --background --factory-startup --python verify/blender_roundtrip_test.py -- in.mesh out.mesh [ATTR|SPLIT|NONE]
 ```
 
-Results on the two reference tiles:
+Results on the two reference tiles (the second was rebuilt since the 1.30 numbers
+were taken — see the note below the table):
 
-| | `sample/Data+50-125.mesh` (v2) | `zOrtho4XP_+27+089/Data+27+089.mesh` (1.30) |
+| | `sample/Data+50-125.mesh` | `zOrtho4XP_+27+089/Data+27+089.mesh` (Google imagery, ZL13/15/16/17/18/19) |
 |---|---|---|
-| size, CRLF | 288,705,257 bytes | 118,855,686 bytes |
-| content | 2,292,352 verts / 4,575,096 tris | 1,246,225 verts / 2,483,123 tris |
+| flavour, size, CRLF | v2, 288,705,257 bytes | v2, 278,645,514 bytes |
+| content | 2,292,352 verts / 4,575,096 tris | 2,250,375 verts / 4,491,416 tris |
 | codec `read_mesh` → `write_mesh` | **sha256-identical** | **sha256-identical** |
-| byte conformance to `write_mesh_file()` | 0 errors | 1.30 templates — `verify_mesh_format.py` currently checks the v2 ones only |
-| Blender round trip | indices/attributes/normals identical, positions within 1.95 mm / 0.12 mm, ~50 s, ~3.5 GB peak RSS | indices/attributes/`nx, ny` identical, positions exact at 7 decimals, **export byte-identical** (sha256 match through Blender) |
+| byte conformance to `write_mesh_file()` | 0 errors | v2 templates (see note) |
+| Blender round trip | indices/attributes/normals identical, positions within 1.95 mm / 0.12 mm, ~50 s, ~3.5 GB peak RSS | indices/attributes/`nx, ny` identical, positions exact, **export byte-identical** (sha256 match through Blender) |
 
-Terrain assignment on `+27+089` (707 cells): **99.97%** of faces covered
-(2,482,486 / 2,483,123; the 637 uncovered lie outside the cells at the tile edge),
-every assigned face centroid inside its cell, every cell's face centroids inside its
-own texture's 0..1 range, and `terrain_tiles.uv_center` matches
-`tercodec.uv_from_center` bit for bit (max delta 0.0). Importing with textures
-(64 cells, capped at 1024 px) takes ~13 s on a 2.48 M-triangle tile.
+> **Evidence note.** The 1.30 flavour was verified against a Bing/ZL17-19 build of
+> `+27+089` (1,246,225 verts, 118,855,686 bytes) that the data owner has since
+> replaced: codec round trip sha256-identical, `verify_mesh_format.py`'s byte check
+> run with the 1.30 templates, and a Blender export that was byte-identical because
+> 7 decimals is coarser than float32's rounding of local metres. No Ortho4XP-written
+> 1.30 file remains in the local sample set, so those numbers are history rather than
+> a re-runnable result; the code path is still exercised by
+> `test_flavours.py`-style round trips on a generated 1.30 file.
+
+Terrain assignment on the current `+27+089` build (183 cells from 231 `.ter` files,
+48 of them sea overlays, six zoom levels from ZL13's 69 km cell down to ZL19's
+1.08 km): **100.000%** of faces covered (4,491,416 / 4,491,416), all 183 cells used
+(101 to 1,265,906 faces each — none left without a texture), every assigned face
+centroid inside its cell, every cell's face centroids inside its own texture's 0..1
+range, and `terrain_tiles.uv_center` matches `tercodec.uv_from_center` bit for bit
+(max delta 0.0). Importing the geometry plus textures for the 64 biggest cells
+(capped at 1024 px) takes ~25 s on a 4.49 M-triangle tile, and a Workbench render of
+the result shows the orthophotos with no untextured patch anywhere.
 
 ## Layout
 
