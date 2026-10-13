@@ -13,3 +13,6 @@ __pycache__/
 .DS_Store
 .venv/
 venv/
+
+# CI packaging output
+dist/

@@ -1,0 +1,100 @@
+name: Blender addon package
+
+# A git tag is the release trigger: it packages the addon folder Blender
+# actually loads into io_scene_ortho4xp_mesh.zip and attaches it to a DRAFT
+# release.  The asset keeps the bare addon name -- Blender 5.2 unpacks
+# <top-level folder> whatever the archive is called, but an unversioned name is
+# what every Blender generation installs without surprises.
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:        # manual run: artifact only, no release
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    env:
+      ADDON: io_scene_ortho4xp_mesh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage the addon folder
+        run: |
+          set -euo pipefail
+          # The addon is the repo root: every top-level .py is a runtime module
+          # (__init__.py, meshcodec.py, tercodec.py, terrain_tiles.py).
+          # doc/, verify/ and the git metadata are not needed by Blender.
+          rm -rf "dist/$ADDON"
+          mkdir -p "dist/$ADDON"
+          cp ./*.py "dist/$ADDON/"
+          test -f "dist/$ADDON/__init__.py"
+          find "dist/$ADDON" -type f | sort
+
+      - name: Check every local import is inside the folder
+        run: |
+          set -euo pipefail
+          # Guards against a new module being added but not shipped.
+          python3 - "dist/$ADDON" <<'PY'
+          import ast, pathlib, sys
+          d = pathlib.Path(sys.argv[1])
+          have = {p.stem for p in d.glob("*.py")}
+          missing = set()
+          for p in d.glob("*.py"):
+              for node in ast.walk(ast.parse(p.read_text(encoding="utf-8"))):
+                  if isinstance(node, ast.ImportFrom) and node.level:
+                      if node.module:                       # from .meshcodec import x
+                          if node.module not in have:
+                              missing.add(node.module)
+                      else:                                 # from . import meshcodec
+                          missing |= {a.name for a in node.names if a.name not in have}
+          if missing:
+              sys.exit(f"module imported but not in the zip: {sorted(missing)}")
+          print("local imports ok:", sorted(have))
+          PY
+
+      - name: Build the zip
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # -X: no extra file attributes; -r: recurse.  The archive has to
+          # contain the io_scene_ortho4xp_mesh/ folder as its top level.
+          zip -r -X "$ADDON.zip" "$ADDON"
+          unzip -l "$ADDON.zip"
+
+      - name: Verify the zip Blender will unpack
+        run: |
+          set -euo pipefail
+          z="dist/$ADDON.zip"
+          list=$(unzip -Z1 "$z")
+          echo "$list"
+          echo "$list" | grep -qx "$ADDON/__init__.py"
+          if echo "$list" | grep -qE '__pycache__|\.pyc$|\.DS_Store|\.git'; then
+            echo "zip contains junk that Blender does not need"; exit 1
+          fi
+          # unpack and byte-compile what Blender will import
+          rm -rf "$RUNNER_TEMP/unzip"
+          unzip -q "$z" -d "$RUNNER_TEMP/unzip"
+          python3 -m compileall -q "$RUNNER_TEMP/unzip/$ADDON"
+          ls -l "$z"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blender-addon
+          path: dist/${{ env.ADDON }}.zip
+          if-no-files-found: error
+
+      - name: Draft release with the zip
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: dist/${{ env.ADDON }}.zip
