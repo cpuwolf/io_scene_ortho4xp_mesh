@@ -183,6 +183,42 @@ FLAVOURS = {
     MC.FLAVOUR_V13: ("1.30", "{:.7f}", 2),
 }
 
+#: viewport clip end set on import.  A tile spans a whole degree (~111 km) and the
+#: default 1000 m cuts all of it away, so the far plane is parked out of reach.
+#: Blender stores clip_end as float32: reads back as 99999997952.0.
+VIEW_CLIP_END = 1.0e11
+
+
+def _far_viewport_clip(value=VIEW_CLIP_END):
+    """Set clip_end on every 3D view of every screen, return how many were set.
+
+    clip_end lives on the viewport (SpaceView3D), not on the scene, so it is one
+    value per workspace screen: the 3D views you are not looking at keep their own
+    and would snap back to 1000 when you switch to them.  Cameras have a separate
+    clip_end and are left alone.
+
+    Each area is tagged for redraw afterwards, otherwise the view in front of you
+    keeps drawing with the old far plane until something else forces a redraw.
+    """
+    count = 0
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            hit = False
+            for space in area.spaces:
+                if space.type == "VIEW_3D":
+                    try:
+                        space.clip_end = value
+                        count += 1
+                        hit = True
+                    except Exception as ex:                  # noqa: BLE001
+                        print("[Ortho4XP mesh] clip_end on %s: %s" % (area.type, ex))
+            if hit:
+                try:
+                    area.tag_redraw()
+                except Exception:                            # noqa: BLE001
+                    pass
+    return count
+
 
 # --------------------------------------------------------------- helpers
 def _georef_from_bounds(west, east, south, north):
@@ -957,6 +993,13 @@ class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
                 print("[Ortho4XP mesh import] the file has non-zero third normal "
                       "components; they are preserved on export unless 'Zero "
                       "third component' is ticked")
+
+        # ---- the tile is ~111 km across, so the default 1000 m viewport clip end
+        # cuts most of it away; park the far plane out of reach on every screen
+        views = _far_viewport_clip()
+        if views:
+            print("[Ortho4XP mesh import] viewport clip end -> %.0f in %d 3D "
+                  "view(s)" % (VIEW_CLIP_END, views))
         self.report({"INFO"}, info)
         return {"FINISHED"}
 

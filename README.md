@@ -198,6 +198,14 @@ lie.
   ~3e-8 degrees. On a v2 tile (15 decimals) that shows up as 1.95 mm horizontally /
   0.12 mm vertically; on a 1.30 tile (7 decimals) it is below the stored precision
   and the exported file is **byte-identical** to the source.
+* A tile spans a whole degree (~111 km) while Blender's viewport far plane defaults
+  to 1000 m, which clips all of it away. Import therefore sets *Clip End* to `1e11`
+  on **every 3D view of every workspace screen** — clip end lives on the viewport,
+  not on the scene, so only fixing the one in front of you would make the others
+  snap back to 1000 m on the next workspace switch. Blender stores it as float32,
+  whose spacing out there is ~8 km, so the panel reads back `99999997952` — far
+  enough past the ~111 km of a tile either way. Cameras keep their own *Clip End*
+  (100 m default), so a camera render still needs it raised by hand.
 
 ## Export
 
