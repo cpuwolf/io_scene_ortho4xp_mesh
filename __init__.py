@@ -662,6 +662,76 @@ def _write_uv_layer(me, slot_affine, layer_name=UV_LAYER):
     return {"layer": layer.name, "loops": int(n_loops), "mapped": mapped}
 
 
+def _mark_seams_from_islands(me, layer_name=UV_LAYER, eps=0.0):
+    """Mark the UV island borders as seams -- Blender's *UV > Seams from Islands*.
+
+    Same answer as the built-in operator, computed on the datablock instead of
+    through edit mode: that menu item on a 4.5M triangle tile costs an 8.6 s edit
+    mode round trip and a 3.2 GB BMesh copy, this costs a sort of the face edges
+    and no second copy of the mesh.
+
+    The operator's rule is narrow, and it is what is reproduced here: *an edge is
+    a seam when the faces sharing it hand that edge's vertices different UVs.*  A
+    border edge (one face) keeps no seam -- it is already a border -- and a
+    non-manifold edge is marked only when its sides actually disagree.  UVs are
+    compared exactly, as the operator does.
+
+    Returns the number of edges marked.
+    """
+    n_loops = len(me.loops)
+    n_poly = len(me.polygons)
+    layer = me.uv_layers.get(layer_name)
+    if layer is None or not n_loops or not n_poly:
+        return 0
+
+    loop_vert = np.empty(n_loops, dtype=np.int32)
+    me.loops.foreach_get("vertex_index", loop_vert)
+    # the mesh already tells every loop which edge it runs along: no need to work
+    # the edge out of the vertex pair, nor to find it again afterwards
+    loop_edge = np.empty(n_loops, dtype=np.int32)
+    me.loops.foreach_get("edge_index", loop_edge)
+    uv = np.empty(n_loops * 2, dtype=np.float32)
+    layer.data.foreach_get("uv", uv)
+    uv = uv.reshape(-1, 2)
+    loop_start = np.empty(n_poly, dtype=np.int32)
+    loop_total = np.empty(n_poly, dtype=np.int32)
+    me.polygons.foreach_get("loop_start", loop_start)
+    me.polygons.foreach_get("loop_total", loop_total)
+
+    # the loop each one runs on to, inside its own face, the last one of a face
+    # wrapping round; that wrap is what keeps the indexing in range, the final
+    # loop of the mesh always being the last loop of a face
+    nxt = np.arange(1, n_loops + 1, dtype=np.int32)
+    nxt[loop_start + loop_total - 1] = loop_start
+
+    other = loop_vert[nxt]
+    # the UV each *side* of the edge hands to the edge's low and high vertex; two
+    # neighbours walk the edge in opposite directions, so it is the vertex each
+    # one is talking about -- not the loop order -- that makes them comparable
+    low_first = (loop_vert <= other)[:, None]
+    u_low = np.where(low_first, uv, uv[nxt])
+    u_high = np.where(low_first, uv[nxt], uv)
+
+    # gather the sides of every edge and compare each one with the first of its
+    # group; the group's first side is arbitrary, and any disagreement is caught
+    # against it whichever side it is, so the sort does not have to be stable
+    order = np.argsort(loop_edge, kind="quicksort")
+    sides = loop_edge[order]
+    starts = np.flatnonzero(np.r_[True, sides[1:] != sides[:-1]])
+    ref = np.repeat(starts, np.diff(np.r_[starts, sides.size]))
+    lo_s, hi_s = u_low[order], u_high[order]
+    if eps:
+        bad = ((np.abs(lo_s - lo_s[ref]) > eps).any(axis=1)
+               | (np.abs(hi_s - hi_s[ref]) > eps).any(axis=1))
+    else:
+        bad = (lo_s != lo_s[ref]).any(axis=1) | (hi_s != hi_s[ref]).any(axis=1)
+
+    seams = np.zeros(len(me.edges), dtype=bool)
+    seams[sides[starts][np.logical_or.reduceat(bad, starts)]] = True
+    me.edges.foreach_set("use_seam", seams)
+    return int(seams.sum())
+
+
 def _import_terrain_textures(op, obj, me, m, georef):
     """Give the tile its orthophotos: a material per .ter cell + one UV layer.
 
@@ -841,6 +911,17 @@ class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
                     "and can be re-anchored with 'Projected UVs' after editing",
         default=True,
     )
+    mark_seams: BoolProperty(
+        name="Seams from UV islands",
+        description="After the terrain UVs are written, mark the borders between "
+                    "UV islands as seams -- Blender's UV > Seams from Islands, so "
+                    "the seams show up in the 3D viewport and 'Select Linked' / "
+                    "'Rip' pick a whole ortho cell. The cell borders are adjacent "
+                    "faces that sample different orthophotos, so this is what tells "
+                    "the cells apart. Needs the UV layer, so it is skipped when "
+                    "'Terrain textures (.ter)' is off",
+        default=True,
+    )
     report_extra: BoolProperty(
         name="Report non-standard input",
         description="Report skipped sections, non-zero vertex references and "
@@ -931,6 +1012,20 @@ class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
                 for value, slot in slots.items():
                     face_slot[m.attr == value] = slot
                 me.polygons.foreach_set("material_index", face_slot)
+
+        # ---- UV island borders as seams (Blender's UV > *Seams from Islands*)
+        if self.mark_seams:
+            n_seams = _mark_seams_from_islands(me)
+            obj["mesh_seams"] = n_seams
+            if n_seams:
+                print("[Ortho4XP mesh import] %d edge(s) marked as seams from "
+                      "the UV islands (one island = one ortho cell)" % n_seams)
+            elif me.uv_layers:
+                print("[Ortho4XP mesh import] every neighbouring face agrees on "
+                      "its UVs: no island border to mark as a seam")
+            else:
+                print("[Ortho4XP mesh import] no UV layer to read (no terrain "
+                      "textures on this import), so no island seam to mark")
 
         # ---- storable metadata (drives the export and the sidebar panel)
         obj["mesh_georef"] = json.dumps(georef)
@@ -1348,6 +1443,37 @@ class MESH_OT_reproject_uvs(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# --------------------------------------------------------------- seams
+class MESH_OT_seams_from_islands(bpy.types.Operator):
+    """Mark the UV island borders as seams, in place"""
+    bl_idname = "mesh.ortho4xp_seams_from_islands"
+    bl_label = "Seams from Islands"
+    bl_description = ("Mark every edge whose two faces hand it different UVs -- "
+                      "what Blender's UV > Seams from Islands does, which on a "
+                      "tile are the borders between ortho cells. Computed on the "
+                      "datablock, so unlike the menu item it needs no edit mode "
+                      "round trip and no second copy of the mesh")
+    bl_options = {"UNDO"}
+
+    def execute(self, context):
+        objs = _tile_targets(context)
+        if not objs:
+            self.report({"WARNING"}, "No Ortho4XP tile mesh to mark")
+            return {"CANCELLED"}
+        edges = 0
+        bare = [o.name for o in objs if not o.data.uv_layers]
+        for obj in objs:
+            seams = _mark_seams_from_islands(obj.data)
+            obj["mesh_seams"] = seams
+            edges += seams
+        for name in bare:
+            self.report({"WARNING"}, "%s has no UV layer: import the terrain "
+                        "textures first" % name)
+        self.report({"INFO"}, "%d seam edge(s) marked on %d tile(s)"
+                    % (edges, len(objs)))
+        return {"FINISHED"}
+
+
 # --------------------------------------------------------------- panel
 class MESH_PT_ortho4xp_panel(bpy.types.Panel):
     bl_label = "Ortho4XP Mesh"
@@ -1417,6 +1543,12 @@ class MESH_PT_ortho4xp_panel(bpy.types.Panel):
                                  "{:,}".format(t.get("uv_loops", 0))))
             if t.get("terrain_dir"):
                 col.label(text=t["terrain_dir"], icon="FILE_FOLDER")
+        seams = obj.get("mesh_seams")
+        if seams is not None:
+            box.label(text="%s seam edge(s) from the UV islands"
+                          % "{:,}".format(int(seams)),
+                      icon="EDGESEL")
+        box.operator(MESH_OT_seams_from_islands.bl_idname, icon="EDGESEL")
         proj = box.column(align=True)
         proj.label(text="texture projection:", icon="TEXTURE")
         proj.label(text="  %s"
@@ -1433,7 +1565,8 @@ class MESH_PT_ortho4xp_panel(bpy.types.Panel):
 
 # --------------------------------------------------------------- registration
 CLASSES = (IMPORT_OT_ortho4xp_mesh, EXPORT_OT_ortho4xp_mesh,
-           MESH_OT_zproject, MESH_OT_reproject_uvs, MESH_PT_ortho4xp_panel)
+           MESH_OT_zproject, MESH_OT_reproject_uvs,
+           MESH_OT_seams_from_islands, MESH_PT_ortho4xp_panel)
 
 
 def _menu_import(self, context):

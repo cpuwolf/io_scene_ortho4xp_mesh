@@ -194,6 +194,18 @@ lie.
   computed per loop from the cell that owns the face, so neighbouring cells sample
   their own texture; `BASE_TEX_NOWRAP` cells use `EXTEND`, so a single vertex that
   strays up to one mesh edge outside its cell clamps instead of wrapping.
+* *Seams from UV islands* (on by default) marks the cell borders as seams, which is
+  what `UV > Seams from Islands` does by hand: two neighbouring faces of different
+  cells hand their shared edge different UVs, so the seams fall exactly on the cell
+  borders and `Select Linked` / `Rip` / the UV editor's island tools work a whole
+  cell at a time. The add-on computes it on the mesh datablock instead of entering
+  edit mode — on the 4.49 M-triangle tile the menu item costs an 8.6 s edit-mode
+  round trip and a 3.2 GB BMesh copy, this costs 7.3 s and no second copy of the
+  mesh. Skipped without the UV layer, i.e. on a geometry-only import. The
+  sidebar's *Ortho4XP* panel has the same thing as a *Seams from Islands* button,
+  for after the UVs have been edited; it acts on every imported tile, like the
+  buttons next to it. `verify/seams_test.py` checks both against the operator,
+  edge for edge.
 * Vertex positions land in Blender's float32 vertices, so the round trip is exact to
   ~3e-8 degrees. On a v2 tile (15 decimals) that shows up as 1.95 mm horizontally /
   0.12 mm vertically; on a 1.30 tile (7 decimals) it is below the stored precision
@@ -235,6 +247,16 @@ python3 verify/verify_mesh_format.py [mesh_file] [--repo /path/to/Ortho4XP]
 
 ```
 blender --background --factory-startup --python verify/blender_roundtrip_test.py -- in.mesh out.mesh [ATTR|SPLIT|NONE]
+```
+
+`verify/seams_test.py` pits the add-on's *Seams from UV islands* against Blender's
+own operator: first the nine hand-built cases that pin the rule down (two faces
+agreeing, two disagreeing by 1e-7, three and four faces on one edge, unwelded
+twins, a lone border edge, a mesh with no UV layer), then a whole `.mesh` tile,
+comparing the two edge sets:
+
+```
+blender --background --factory-startup --python verify/seams_test.py -- [tile.mesh]
 ```
 
 Results on the two reference tiles (the second was rebuilt since the 1.30 numbers
