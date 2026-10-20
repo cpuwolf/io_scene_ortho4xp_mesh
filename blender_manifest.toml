@@ -1,0 +1,27 @@
+schema_version = "1.0.0"
+
+# Blender extension manifest for the Ortho4XP mesh importer/exporter.
+# Kept at the repository root so `blender --command extension build` works from
+# here; the zip it produces has these files at the archive root (Blender unpacks
+# them into extensions/<repo>/io_scene_ortho4xp_mesh/).
+
+id = "io_scene_ortho4xp_mesh"
+version = "1.3.0"
+name = "Ortho4XP Mesh Import/Export"
+tagline = "Edit Ortho4XP tile meshes with their orthophotos in Blender"
+maintainer = "Wei Shuai"
+type = "add-on"
+
+# Valid add-on tags on extensions.blender.org:
+# https://docs.blender.org/manual/en/latest/advanced/extensions/tags.html
+tags = ["Import-Export", "UV", "Mesh"]
+
+website = "https://github.com/cpuwolf/io_scene_ortho4xp_mesh"
+# The platform only lists GPL-compliant add-ons; this is the required license.
+license = ["SPDX:GPL-3.0-or-later"]
+
+# Extensions exist from 4.2 on, and this package needs one to be installable at
+# all (see the note at the top of __init__.py).
+blender_version_min = "4.2.0"
+
+copyright = ["2026 Wei Shuai"]

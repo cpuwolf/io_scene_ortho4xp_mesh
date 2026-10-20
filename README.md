@@ -1,8 +1,10 @@
-# Ortho4XP Mesh Import/Export (Blender addon)
+# Ortho4XP Mesh Import/Export (Blender extension)
 
 Read and write Ortho4XP tile meshes — `Data+50-125.mesh`, `Data+27+089.mesh` etc. — in
-Blender 4.0+ (tested on Blender 5.2.2 LTS, macOS), with the tile's `.ter`
+Blender 4.2+ (tested on Blender 5.2.2 LTS, macOS), with the tile's `.ter`
 orthophotos attached on import.
+
+<img src="doc/previews/preview_tile.png" width="760" alt="The +27+089 tile (Paro, Bhutan) imported with its orthophotos and rendered in Blender">
 
 <table>
 <tr>
@@ -19,42 +21,52 @@ orthophotos attached on import.
 
 ## Install
 
-This folder *is* the addon. There is nothing to build and no Python packages to install
-outside Blender (`numpy` ships with Blender; the `.mesh` codec itself is numpy-only).
+This repository *is* the package: `blender_manifest.toml` plus four Python modules. There is
+nothing to build and no Python packages to install outside Blender (`numpy` ships with
+Blender; the `.mesh` codec itself is numpy-only).
 
-**1. Put the folder where Blender looks for addons:**
+It is packaged as a **Blender extension**, so it needs **Blender 4.2 or newer**.
 
-| OS | Addon folder |
-|---|---|
-| macOS | `~/Library/Application Support/Blender/<version>/scripts/addons/` |
-| Windows | `%APPDATA%\Blender Foundation\Blender\<version>\scripts\addons\` |
-| Linux | `~/.config/blender/<version>/scripts/addons/` |
+**From the extensions platform** — *Edit → Preferences → Get Extensions*, search for
+**Ortho4XP Mesh**, then *Install*.  (Listing: <https://extensions.blender.org/>)
 
-Copy it in, or symlink it so that `git pull` updates your Blender in place:
+**From a zip** — take `io_scene_ortho4xp_mesh-<version>.zip` from the
+[releases](../../releases) page and use *Get Extensions → ⌄ → Install from Disk*. The archive
+holds the package files at its root (no top folder) — that is what makes it an extension
+rather than a legacy add-on folder.
+
+**From a git checkout** — symlink the checkout into a local repository and Blender loads your
+working copy, so `git pull` (or an edit) is all it takes:
 
 ```sh
+mkdir -p ~/Library/Application\ Support/Blender/5.2/extensions/user_default
 ln -s /path/to/io_scene_ortho4xp_mesh \
-      ~/Library/Application\ Support/Blender/5.2/scripts/addons/io_scene_ortho4xp_mesh
+      ~/Library/Application\ Support/Blender/5.2/extensions/user_default/io_scene_ortho4xp_mesh
 ```
 
-Keep the folder name `io_scene_ortho4xp_mesh` — it is the module name Blender imports.
+| OS | user_default repository |
+|---|---|
+| macOS | `~/Library/Application Support/Blender/<version>/extensions/user_default/` |
+| Windows | `%APPDATA%\Blender Foundation\Blender\<version>\extensions\user_default\` |
+| Linux | `~/.config/blender/<version>/extensions/user_default/` |
 
-**2. Enable it:** *Edit → Preferences → Add-ons*, search for **Ortho4XP Mesh**, tick
-**Ortho4XP Mesh Import/Export**.
+**Enable it:** *Edit → Preferences → Get Extensions*, find **Ortho4XP Mesh Import/Export** in
+the installed list and tick it.
 
-*Alternative:* zip this folder and use *Install from Disk…* in the same panel (the ZIP has
-to contain the `io_scene_ortho4xp_mesh` folder as its top level).
+> **Not a legacy add-on any more.** The package carries no legacy metadata (it lives in
+> `blender_manifest.toml`), so a copy dropped into `scripts/addons/` is ignored — Blender
+> 4.0/4.1 cannot load this version at all. Use the extensions paths above.
 
-**3. Where it appears:**
+**Where it appears:**
 
 * `File → Import → Ortho4XP Mesh (.mesh)`
 * `File → Export → Ortho4XP Mesh (.mesh)`
 * 3D viewport sidebar (`N`) → tab **Ortho4XP** — tile info, triangle attributes, texture
   stats, and the *Seams from Islands* / *Fix to map* / *Projected UVs* buttons
 
-**Requirements:** Blender 4.0 or newer. The `.mesh` parser and the `.ter` face assignment
-are `bpy`-free, so they also run headless with plain `numpy` (that is how they are
-verified — see [doc/verification.md](doc/verification.md)).
+**Requirements:** Blender 4.2 or newer (extension; tested on 5.2.2 LTS). The `.mesh` parser
+and the `.ter` face assignment are `bpy`-free, so they also run headless with plain `numpy`
+(that is how they are verified — see [doc/verification.md](doc/verification.md)).
 
 ---
 
@@ -99,5 +111,6 @@ more detail.
 | [doc/terrain-textures.md](doc/terrain-textures.md) | how the tile's `.ter` cells become materials + UVs, the lattice tiling, and the `tex_limit` / `tex_max_px` memory knobs |
 | [doc/import-and-export.md](doc/import-and-export.md) | every import and export option, the sidebar panel, what survives a round trip and what does not |
 | [doc/verification.md](doc/verification.md) | the `verify/` scripts, measured results on real tiles, repository layout |
+| [doc/extensions-listing.md](doc/extensions-listing.md) | the text used for the extensions.blender.org listing, kept in sync with `blender_manifest.toml` |
 | [doc/workflow-en.html](doc/workflow-en.html) | workflow diagram (English) — standalone HTML, open in a browser |
 | [doc/ortho4xp-blender-workflow.html](doc/ortho4xp-blender-workflow.html) | 工作流图解（中文）— standalone HTML |

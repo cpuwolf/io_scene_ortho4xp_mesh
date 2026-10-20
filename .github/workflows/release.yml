@@ -1,10 +1,10 @@
-name: Blender addon package
+name: Blender extension package
 
-# A git tag is the release trigger: it packages the addon folder Blender
-# actually loads into io_scene_ortho4xp_mesh.zip and attaches it to a DRAFT
-# release.  The asset keeps the bare addon name -- Blender 5.2 unpacks
-# <top-level folder> whatever the archive is called, but an unversioned name is
-# what every Blender generation installs without surprises.
+# A tag is the release trigger: it builds the Blender *extension* zip and attaches
+# it to a DRAFT release.  The archive holds the package files at its root (no top
+# folder) with blender_manifest.toml among them, which is what
+# Preferences > Get Extensions > Install from disk and the extensions platform
+# expect; the file name carries the version because the platform does.
 
 on:
   push:
@@ -24,28 +24,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Stage the addon folder
+      - name: Read the version from the manifest
+        id: manifest
         run: |
           set -euo pipefail
-          # The addon is the repo root: every top-level .py is a runtime module
-          # (__init__.py, meshcodec.py, tercodec.py, terrain_tiles.py).
-          # doc/, verify/ and the git metadata are not needed by Blender.
-          rm -rf "dist/$ADDON"
-          mkdir -p "dist/$ADDON"
-          cp ./*.py "dist/$ADDON/"
-          test -f "dist/$ADDON/__init__.py"
-          find "dist/$ADDON" -type f | sort
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' blender_manifest.toml)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "packaging $ADDON $version"
 
-      - name: Check every local import is inside the folder
+      - name: Check every local import is inside the package
         run: |
           set -euo pipefail
           # Guards against a new module being added but not shipped.
-          python3 - "dist/$ADDON" <<'PY'
-          import ast, pathlib, sys
-          d = pathlib.Path(sys.argv[1])
-          have = {p.stem for p in d.glob("*.py")}
+          python3 - <<'PY'
+          import ast, pathlib
+          have = {p.stem for p in pathlib.Path(".").glob("*.py")}
           missing = set()
-          for p in d.glob("*.py"):
+          for p in pathlib.Path(".").glob("*.py"):
               for node in ast.walk(ast.parse(p.read_text(encoding="utf-8"))):
                   if isinstance(node, ast.ImportFrom) and node.level:
                       if node.module:                       # from .meshcodec import x
@@ -54,39 +50,47 @@ jobs:
                       else:                                 # from . import meshcodec
                           missing |= {a.name for a in node.names if a.name not in have}
           if missing:
-              sys.exit(f"module imported but not in the zip: {sorted(missing)}")
+              raise SystemExit(f"module imported but not shipped: {sorted(missing)}")
           print("local imports ok:", sorted(have))
           PY
 
-      - name: Build the zip
-        working-directory: dist
+      - name: Build the extension zip
         run: |
           set -euo pipefail
-          # -X: no extra file attributes; -r: recurse.  The archive has to
-          # contain the io_scene_ortho4xp_mesh/ folder as its top level.
-          zip -r -X "$ADDON.zip" "$ADDON"
-          unzip -l "$ADDON.zip"
+          # The package is the repo root minus doc/, verify/, .github/ and the git
+          # metadata: every top-level .py is a runtime module.
+          rm -rf dist && mkdir -p dist
+          zip -X "dist/$ADDON-${{ steps.manifest.outputs.version }}.zip" \
+              ./*.py blender_manifest.toml LICENSE README.md
 
-      - name: Verify the zip Blender will unpack
+      - name: Verify the archive layout
         run: |
           set -euo pipefail
-          z="dist/$ADDON.zip"
-          list=$(unzip -Z1 "$z")
-          echo "$list"
-          echo "$list" | grep -qx "$ADDON/__init__.py"
-          if echo "$list" | grep -qE '__pycache__|\.pyc$|\.DS_Store|\.git'; then
-            echo "zip contains junk that Blender does not need"; exit 1
+          z="dist/$ADDON-${{ steps.manifest.outputs.version }}.zip"
+          unzip -Z1 "$z" | sort
+          # Files at the root only -- a top-level folder would make it a legacy add-on.
+          if unzip -Z1 "$z" | grep -q '/'; then
+            echo "archive has directories; an extension expects files at the root"; exit 1
           fi
-          # unpack and byte-compile what Blender will import
-          rm -rf "$RUNNER_TEMP/unzip"
-          unzip -q "$z" -d "$RUNNER_TEMP/unzip"
-          python3 -m compileall -q "$RUNNER_TEMP/unzip/$ADDON"
+          for f in blender_manifest.toml LICENSE __init__.py; do
+            unzip -Z1 "$z" | grep -qx "$f" || { echo "missing $f"; exit 1; }
+          done
+          if unzip -Z1 "$z" | grep -qE '__pycache__|\.pyc$|\.DS_Store|^\.'; then
+            echo "zip contains junk"; exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/x" && unzip -q "$z" -d "$RUNNER_TEMP/x"
+          # A module still carrying the legacy metadata key makes Blender treat the
+          # whole package as a legacy add-on and ignore the manifest.
+          if grep -rl 'bl_info' "$RUNNER_TEMP/x" --include='*.py'; then
+            echo "a shipped module still has the legacy metadata key"; exit 1
+          fi
+          python3 -m compileall -q "$RUNNER_TEMP/x"
           ls -l "$z"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: blender-addon
-          path: dist/${{ env.ADDON }}.zip
+          name: blender-extension
+          path: dist/${{ env.ADDON }}-${{ steps.manifest.outputs.version }}.zip
           if-no-files-found: error
 
       - name: Draft release with the zip
@@ -97,4 +101,4 @@ jobs:
           name: ${{ github.ref_name }}
           draft: true
           generate_release_notes: true
-          files: dist/${{ env.ADDON }}.zip
+          files: dist/${{ env.ADDON }}-${{ steps.manifest.outputs.version }}.zip

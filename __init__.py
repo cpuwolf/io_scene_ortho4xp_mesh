@@ -1,13 +1,9 @@
-bl_info = {
-    "name": "Ortho4XP Mesh Import/Export",
-    "author": "cpuwolf@gmail.com",
-    "version": (1, 3, 0),
-    "blender": (4, 0, 0),
-    "location": "File > Import/Export > Ortho4XP Mesh; View3D > Sidebar > Ortho4XP",
-    "description": "Read and write Ortho4XP tile meshes (.mesh) with the tile's "
-                   ".ter orthophotos",
-    "category": "Import-Export",
-}
+# Distributed as a Blender *extension*: the metadata that used to live in the
+# legacy header dict (name, author, version, minimum Blender version, license)
+# is now in blender_manifest.toml.  The legacy dict is deliberately gone --
+# Blender treats a package as a legacy add-on, ignoring the manifest, as soon as
+# any .py in the zip still carries that key name, so it must not come back here
+# or in any other shipped module.
 
 """
 Ortho4XP tile mesh (.mesh) importer/exporter for Blender.
