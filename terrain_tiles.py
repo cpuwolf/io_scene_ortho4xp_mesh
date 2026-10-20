@@ -376,7 +376,6 @@ class TerrainIndex:
         la = lat.ravel()
         lo = lon.ravel()
         out = np.full(la.size, -1, dtype=np.int32)
-        rows = np.arange(chunk)
         for start in range(0, la.size, chunk):
             sl = slice(start, min(start + chunk, la.size))
             y = la[sl]
@@ -392,9 +391,16 @@ class TerrainIndex:
             ok &= (x[:, None] >= self.c_lon0[ci]) & (x[:, None] <= self.c_lon1[ci])
             hit = ok.any(axis=1)
             if hit.any():
-                # candidates are pre-sorted finest-first, so the first hit wins
+                # candidates are pre-sorted finest-first, so the first hit wins.
+                # `pick` and `cand[...]` are indexed by the *hit rows only*, so they
+                # have to be scattered back into a full-length chunk: a bare
+                # np.where(hit, cand[...], -1) mixes a (n,) mask with a (hits,)
+                # array and blows up as soon as one point in the chunk misses
+                rows_hit = np.flatnonzero(hit)
                 pick = np.argmax(ok[hit], axis=1)
-                out[sl] = np.where(hit, cand[rows[:y.size][hit], pick], -1)
+                chunk_out = np.full(y.size, -1, dtype=np.int32)
+                chunk_out[rows_hit] = cand[rows_hit, pick]
+                out[sl] = chunk_out
         return out.reshape(shape)
 
     def centroid_cells(self, lat, lon, tris):

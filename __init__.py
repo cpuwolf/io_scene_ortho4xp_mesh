@@ -145,6 +145,7 @@ was imported with.
 import json
 import math
 import os
+import traceback
 
 import bpy
 import numpy as np
@@ -991,6 +992,9 @@ class IMPORT_OT_ortho4xp_mesh(bpy.types.Operator, ImportHelper):
             try:
                 tex_stats = _import_terrain_textures(self, obj, me, m, georef)
             except Exception as ex:                            # noqa: BLE001
+                # the tile itself imported fine; a traceback here is the only way to
+                # find which cell/face made the texture pass give up
+                traceback.print_exc()
                 print("[Ortho4XP mesh import] terrain textures failed: %s" % ex)
                 self.report({"WARNING"}, "Terrain textures failed: %s" % ex)
 

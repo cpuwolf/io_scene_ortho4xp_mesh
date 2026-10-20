@@ -1,6 +1,6 @@
 # Verification
 
-Four scripts in `verify/`. Two of them are plain Python (they exercise the `bpy`-free
+Five scripts in `verify/`. Three of them are plain Python (they exercise the `bpy`-free
 modules `meshcodec.py` / `terrain_tiles.py` headless); two need Blender.
 
 ## `verify/verify_mesh_format.py` — a file against Ortho4XP's own code
@@ -70,6 +70,20 @@ it they kink at the moved patch.
 blender --background --factory-startup --python verify/zproject_test.py -- [outdir]
 ```
 
+## `verify/terrain_lookup_test.py` — face → ortho cell assignment, with holes
+
+`terrain_tiles.TerrainIndex.lookup` walks the faces in chunks of 65536 points, and a tile
+whose `.ter` set covers every face never exercises the miss path. This one builds a
+synthetic lattice *with gaps*, a finer cell inside it and a sea overlay twin of one plain
+cell, then compares the chunked answer against brute force: cell centres resolve to their
+own cell (finest first, overlay first), gap and off-lattice points come back `-1`, 150k
+random points (>2 chunks, so full chunks containing misses exist) match element for
+element, and the answer is the same for chunk sizes 65536 / 1000 / 7.
+
+```sh
+python3 verify/terrain_lookup_test.py
+```
+
 ## Measured results on the two reference tiles
 
 |  | `sample/Data+50-125.mesh` | `zOrtho4XP_+27+089/Data+27+089.mesh` (Google imagery, ZL13/15/16/17/18/19) |
@@ -116,7 +130,7 @@ meshcodec.py      dependency-free (numpy only) .mesh reader/writer + OrthoMesh
 terrain_tiles.py  .ter cell scan, lattice footprints, face assignment, UV maths
 tercodec.py       .ter parser + uv_from_center (from xplane-dsf-blender)
 doc/              this documentation (+ two standalone workflow diagrams as HTML)
-verify/           verification scripts (format + Blender round trip + seams + z projection)
+verify/           verification scripts (format, lookup, Blender round trip, seams, z projection)
 ```
 
 `meshcodec.py` and `terrain_tiles.py` import no `bpy`, so both can be exercised headless —
