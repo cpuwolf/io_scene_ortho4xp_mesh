@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Ortho4XP Mesh Import/Export",
-    "author": "built for rourou",
-    "version": (1, 2, 0),
+    "author": "cpuwolf@gmail.com",
+    "version": (1, 3, 0),
     "blender": (4, 0, 0),
     "location": "File > Import/Export > Ortho4XP Mesh; View3D > Sidebar > Ortho4XP",
     "description": "Read and write Ortho4XP tile meshes (.mesh) with the tile's "
