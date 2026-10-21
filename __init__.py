@@ -1024,13 +1024,16 @@ def _import_dsf_terrain(op, context):
                     known.append(v)
         if missing_seen and len(known) >= 400:
             break
-    fit = DC.fit_raster(dsf.rasters, known, bounds) if (missing_seen and dsf.rasters) else None
+    fit = DC.pick_dem(dsf.rasters, bounds, known) if (missing_seen and dsf.rasters) else None
     if fit is not None:
         stats["raster"] = {"width": fit[0].width, "height": fit[0].height,
                            "flip_y": bool(fit[1]), "dx": float(fit[2]),
-                           "dy": float(fit[3]), "fit_error_m": round(fit[4], 2)}
-        print("[X-Plane DSF import] raster DEM %dx%d registered against the mesh: "
-              "median error %.1f m" % (fit[0].width, fit[0].height, fit[4]))
+                           "dy": float(fit[3]), "fit_error_m": round(fit[4], 2),
+                           "sharpness_m_per_px": round(fit[5], 2)}
+        print("[X-Plane DSF import] DEM layer %dx%d picked for detail "
+              "(%.1f m/px between neighbouring pixels), registered to the mesh: "
+              "median error %.1f m"
+              % (fit[0].width, fit[0].height, fit[5], fit[4]))
 
     # ---- flatten pools into one vertex array; DSF triangles are clockwise seen
     # from above, so the winding is reversed to get +Z normals in Blender

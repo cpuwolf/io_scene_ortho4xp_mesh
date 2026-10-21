@@ -56,18 +56,33 @@ under the real landscape ("flat water with the mountains floating in the sky").
 So the importer reads the raster too:
 
 1. every raster layer in `DEMS` is parsed (int/uint/float, 1-4 bytes per pixel);
-2. the layer that really is this tile's elevation grid is **identified by fitting it to
-   the heights the mesh already carries** — both row orders and a pixel-offset search,
-   best median error wins, and only a fit under 120 m is accepted;
+2. **the layer is chosen by detail, not by agreement with the mesh.** A tile ships the
+   same landscape at two resolutions, and the smoothed variant fits the mesh *better*
+   simply because it is flatter — picking on that metric is what made whole tiles come
+   in as plateaus. The sharpest plausible full-tile layer wins (`+45-111`: 41 m/px
+   between neighbouring pixels for the sharp layer against 3 m/px for the smoothed
+   one), and only its registration (row order, pixel offset) is measured, against the
+   heights the mesh already carries;
 3. vertices at the `-32768 m` floor are then sampled bilinearly from that grid, with
    edge-extend at the tile border.
+
+Which layer is the real DEM is not a matter of taste — `apt.dat` gives the surveyed
+elevation of every airport:
+
+| airport in `+45-111` | apt.dat | sharp layer | smoothed layer |
+|---|---|---|---|
+| 29S Gardiner | 1611 m | 1602 m (**-9 m**) | 1572 m (-39 m) |
+| KLVM Livingston | 1420 m | 1412 m (**-8 m**) | 1322 m (-98 m) |
+
+With the sharp layer the tile imports as 1235…3434 m (its highest Absaroka ridge is
+3439 m on that layer), against 1233…3061 m for the smoothed one.
 
 Measured on real tiles (`median error` = raster vs the mesh's own heights):
 
 | tile | raster used | fit median error | triangles | kept | z range after |
 |---|---|---|---|---|---|
-| `+45-111` (Yellowstone) | 1201×1201 int16 | **1.0 m** | 461,347 | all | 1233…3061 m |
-| `+28-097` (Texas coast) | 1201×1201 int16 | **0.0 m** | 266,689 | all | 0…47 m |
+| `+45-111` (Yellowstone) | 1201×1201 int16, the sharp one | **1.6 m** | 461,347 | all | 1235…3434 m |
+| `+28-097` (Texas coast) | 1201×1201 int16 | **1.0 m** | 266,689 | all | -50…39 m |
 | `+27+089` (Ortho4XP-built) | not needed | — | 4,577,322 | all | 445…7295 m |
 
 A file with no usable raster (or none at all, like an Ortho4XP-built DSF) still imports;

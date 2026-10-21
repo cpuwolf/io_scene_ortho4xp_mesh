@@ -325,6 +325,72 @@ def _read_dems(raw, s, e):
     return out
 
 
+def _sharpness(r, step=4, probe=200000):
+    """Mean |elevation difference| between neighbouring pixels (metres per pixel).
+
+    This is how the layers are told apart: the same landscape is shipped twice, and the
+    smoothed variant (a lower LOD) is several times flatter than the real DEM.  Pixel
+    count is capped so a 1201x1201 layer costs milliseconds.
+    """
+    v = r.vals
+    w, h = r.width, r.height
+    scale = r.scale or 1.0
+    if w < 2:
+        return 0.0
+    total = 0.0
+    n = 0
+    rows = range(0, h, step)
+    for y in rows:
+        base = y * w
+        for x in range(0, w - step, step):
+            total += abs(v[base + x + step] - v[base + x]) * scale
+            n += 1
+            if n >= probe:
+                return total / n
+    return total / n if n else 0.0
+
+
+def pick_dem(rasters, bounds, samples, min_width=512, max_points=200, accept_m=250.0):
+    """Choose the tile's DEM layer and register it.
+
+    Detail decides the layer, not agreement with the mesh: a smoothed LOD variant of
+    the same DEM fits the mesh *better* (it is flatter, so less to disagree with) and
+    is exactly the wrong choice -- it flattens the whole tile.  The sharpest plausible
+    full-tile layer is therefore used, and only its registration (row order, pixel
+    offset) is measured, against the heights the mesh already carries.
+
+    Returns ``(raster, flip_y, dx, dy, median_error_m, sharpness)`` or None.
+    """
+    cands = []
+    for r in rasters:
+        if r.width < min_width or r.height < min_width:
+            continue
+        if r.fmt == 0 and r.bpp != 4:
+            continue
+        vals = r.vals
+        step = max(1, len(vals) // 20000)
+        scale = r.scale or 1.0
+        lo = min(vals[::step]) * scale + (r.offset or 0.0)
+        hi = max(vals[::step]) * scale + (r.offset or 0.0)
+        if not (-900.0 <= lo <= 9000.0 and -900.0 <= hi <= 9000.0) or hi - lo < 20.0:
+            continue                       # a mask/depth layer, not terrain
+        # a layer is only a DEM candidate if it can reproduce heights the mesh already
+        # has; masks, water depth and class rasters fail this even when their value
+        # range happens to look like metres
+        fit = fit_raster([r], samples, bounds, min_width=min_width,
+                         max_points=max_points, accept_m=10.0)
+        if fit is None:
+            continue
+        cands.append((_sharpness(r), r, fit))
+    if not cands:
+        return None
+    # detail decides between the survivors: the sharp layer is the real DEM, the
+    # smoothed one is a lower LOD of the same landscape
+    cands.sort(key=lambda t: -t[0])
+    sharp, r, fit = cands[0]
+    return fit[0], fit[1], fit[2], fit[3], fit[4], sharp
+
+
 def fit_raster(rasters, samples, bounds, min_width=64, max_points=200, accept_m=120.0):
     """Find the raster layer that really is this tile's elevation grid.
 
