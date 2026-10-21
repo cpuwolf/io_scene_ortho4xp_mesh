@@ -40,6 +40,11 @@ except ImportError:                         # run headless as a plain script
     import sevenzip as SZ
 
 COOKIE = b"XPLNEDSF"
+
+#: Elevation floor. Terrain planes store elevation as raw-32768 metres, so a raw 0
+#: decodes to -32768 m: X-Plane leaves whole LOD layers like that (no height, zero
+#: normals) and takes their height from the tile's raster DEM instead.
+NO_ELEVATION_M = -30000.0
 MASTER_VERSION = 1
 RECIP16 = 1.0 / 65535.0
 RECIP32 = 1.0 / 4294967295.0
@@ -224,6 +229,144 @@ def _read_scal(buf, s, e):
     return [(floats[i], floats[i + 1]) for i in range(0, n - 1, 2)]
 
 
+# ------------------------------------------------------------------- rasters
+#: X-Plane 12 DSF tiles carry their terrain heights twice: in the point pools (the
+#: mesh) and in a raster DEM (`DEMS` container: `DEMI` header + `DEMD` pixels).  A
+#: vertex whose pool elevation is 0 (which decodes to NO_ELEVATION_M) has no height
+#: of its own -- Global Scenery leaves whole LOD layers that way -- so the raster is
+#: the file's own source for it.
+A_DEMS = "DEMS"
+A_DEMI = "DEMI"
+A_DEMD = "DEMD"
+
+
+class Raster:
+    """One DEM layer: a width x height grid of raw samples plus scale/offset."""
+
+    __slots__ = ("width", "height", "bpp", "fmt", "flags", "scale", "offset", "vals")
+
+    def __init__(self, width, height, bpp, fmt, flags, scale, offset, vals):
+        self.width = width
+        self.height = height
+        self.bpp = bpp
+        self.fmt = fmt
+        self.flags = flags
+        self.scale = scale
+        self.offset = offset
+        self.vals = vals
+
+    def __repr__(self):
+        return ("<Raster %dx%d bpp%d fmt%d scale %g offset %g>"
+                % (self.width, self.height, self.bpp, self.fmt, self.scale,
+                   self.offset))
+
+    def height_at(self, lon, lat, bounds, flip_y=True, dx=0.0, dy=0.0):
+        """Bilinear height in metres at lon/lat, or None outside the grid.
+
+        The grid is registered to the tile's bounds; `flip_y`/`dx`/`dy` are the
+        alignment `fit_raster` measured, because the writer's pixel-centre
+        convention is not something the file states.
+        """
+        west, east, south, north = bounds
+        w, h = self.width, self.height
+        if w < 2 or h < 2 or east == west or north == south:
+            return None
+        fx = (lon - west) / (east - west) * (w - 1) + dx
+        fy = (((lat - south) / (north - south)) if flip_y
+              else ((north - lat) / (north - south))) * (h - 1) + dy
+        # edge-extend rather than refuse: a vertex a few metres outside the grid
+        # (patch overhang at the tile border) takes the border height, which is
+        # what a raster read does everywhere else
+        fx = min(max(fx, 0.0), w - 1.0)
+        fy = min(max(fy, 0.0), h - 1.0)
+        x0, y0 = int(fx), int(fy)
+        if x0 >= w - 1:
+            x0 = w - 2
+            fx = float(x0)
+        if y0 >= h - 1:
+            y0 = h - 2
+            fy = float(y0)
+        tx, ty = fx - x0, fy - y0
+        v = self.vals
+        i = y0 * w + x0
+        top = v[i] * (1.0 - tx) + v[i + 1] * tx
+        bot = v[i + w] * (1.0 - tx) + v[i + w + 1] * tx
+        return (top * (1.0 - ty) + bot * ty) * self.scale + self.offset
+
+
+def _read_dems(raw, s, e):
+    """Decode a `DEMS` container into a list of Raster objects."""
+    out = []
+    headers, blocks = [], []
+    for name, a, b in iter_atoms(raw, s, e):
+        if name == A_DEMI:
+            headers.append((a, b))
+        elif name == A_DEMD:
+            blocks.append((a, b))
+    for (hs, he), (ds, de) in zip(headers, blocks):
+        if he - hs < 20:
+            continue
+        ver, bpp, flags, w, h, scale, offset = struct.unpack_from("<BBHIIff", raw, hs)
+        fmt = flags & 0x3
+        if w == 0 or h == 0 or bpp not in (1, 2, 4):
+            continue
+        code = {0: "f", 1: {1: "b", 2: "h", 4: "i"},
+                2: {1: "B", 2: "H", 4: "I"},
+                3: {1: "B", 2: "H", 4: "I"}}[fmt][bpp]
+        count = min(w * h, (de - ds) // bpp)
+        if count < w * h:
+            continue
+        vals = struct.unpack_from("<%d%s" % (w * h, code), raw, ds)
+        if fmt == 3:                       # normalised unsigned: 0..1 of the range
+            top = float((1 << (8 * bpp)) - 1)
+            vals = tuple(v / top for v in vals)
+            scale, offset = (scale, offset) if scale else (1.0, 0.0)
+        out.append(Raster(w, h, bpp, fmt, flags, scale, offset, vals))
+    return out
+
+
+def fit_raster(rasters, samples, bounds, min_width=64, max_points=200, accept_m=120.0):
+    """Find the raster layer that really is this tile's elevation grid.
+
+    `samples` are pool vertices the mesh already gives a height for (only their
+    lon, lat and elevation are read), so the fit is measured against data, not assumed: every candidate raster
+    is tried with both row orders and a small pixel-offset search, and the best
+    one is accepted only if it reproduces those heights closely.
+
+    Returns ``(raster, flip_y, dx, dy, median_error_m)`` or None.
+    """
+    if not rasters or not samples:
+        return None
+    pts = samples[::max(1, len(samples) // max_points)][:max_points]
+    best = None
+    for r in rasters:
+        if r.width < min_width or r.height < min_width:
+            continue
+        for flip_y in (True, False):
+            # coarse search, then refine around the winner
+            for step, span in ((8.0, 24.0), (2.0, 6.0), (1.0, 2.0)):
+                centre = (best[2], best[3]) if best and best[0] is r else (0.0, 0.0)
+                offsets = [(centre[0] + sx * step, centre[1] + sy * step)
+                           for sx in range(-int(span / step), int(span / step) + 1)
+                           for sy in range(-int(span / step), int(span / step) + 1)]
+                for dx, dy in offsets:
+                    diffs = []
+                    for p in pts:
+                        lon, lat, z = p[0], p[1], p[2]
+                        hv = r.height_at(lon, lat, bounds, flip_y, dx, dy)
+                        if hv is not None:
+                            diffs.append(abs(hv - z))
+                    if len(diffs) < max(8, len(pts) // 2):
+                        continue
+                    diffs.sort()
+                    med = diffs[len(diffs) // 2]
+                    if best is None or med < best[4]:
+                        best = (r, flip_y, dx, dy, med)
+    if best is None or best[4] > accept_m:
+        return None
+    return best[0], best[1], best[2], best[3], best[4]
+
+
 @dataclass
 class Patch:
     """One terrain patch: triangles sharing terrain definition / LOD / flags."""
@@ -244,6 +387,7 @@ class DSF:
     unhandled: dict = field(default_factory=dict)      # cmd id -> count
     source_path: str | None = None
     was_compressed: bool = False
+    rasters: list = field(default_factory=list)        # DEM layers (Raster objects)
 
     def prop(self, name, default=None):
         for k, v in self.props:
@@ -293,7 +437,7 @@ def _parse(dsf: DSF, raw: bytes):
     if hashlib.md5(raw[:body_end]).digest() != raw[body_end:]:
         dsf.props.append(("_dsf/md5_mismatch", "1"))
 
-    geod = cmds = None
+    geod = cmds = dems = None
     for name, s, e in iter_atoms(raw, 12, body_end):
         if name == A_HEAD:
             for n2, s2, e2 in iter_atoms(raw, s, e):
@@ -308,6 +452,8 @@ def _parse(dsf: DSF, raw: bytes):
             geod = (s, e)
         elif name == A_CMDS:
             cmds = (s, e)
+        elif name == A_DEMS:
+            dems = (s, e)
 
     if geod is None or cmds is None:
         raise DSFError("DSF missing GEOD or CMDS atom")
@@ -346,6 +492,9 @@ def _parse(dsf: DSF, raw: bytes):
             out.append(verts)
             scal_out.append([(float(a), float(b)) for a, b in sc])
         return out, scal_out
+
+    if dems is not None:
+        dsf.rasters = _read_dems(raw, dems[0], dems[1])
 
     pools16, scal16 = build(pool_pairs, scales, False)
     pools32, scal32 = build(pool32_pairs, scales32, True)

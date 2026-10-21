@@ -1006,6 +1006,32 @@ def _import_dsf_terrain(op, context):
              "uv_layer": None, "uv_mapped": 0, "max_px": int(op.tex_max_px),
              "zproj": bool(op.zproj), "unhandled": dict(dsf.unhandled)}
 
+    # ---- the tile's raster DEM is the file's own source of height for vertices that
+    # carry none: Global Scenery writes raw elevation 0 (which decodes to -32768 m)
+    # and zero normals for whole LOD layers, so the mesh alone cannot place them.
+    # The raster is registered against the heights the mesh *does* carry, and only
+    # used when it reproduces them closely -- a wrong layer is detected, not trusted.
+    bounds = (west, east, south, north)
+    known = []
+    missing_seen = False
+    for pa in dsf.patches:
+        for tri in pa.triangles:
+            for pool_i, vert_i in tri:
+                v = dsf.pools[pool_i][vert_i]
+                if v[2] <= DC.NO_ELEVATION_M:
+                    missing_seen = True
+                elif len(known) < 4000:
+                    known.append(v)
+        if missing_seen and len(known) >= 400:
+            break
+    fit = DC.fit_raster(dsf.rasters, known, bounds) if (missing_seen and dsf.rasters) else None
+    if fit is not None:
+        stats["raster"] = {"width": fit[0].width, "height": fit[0].height,
+                           "flip_y": bool(fit[1]), "dx": float(fit[2]),
+                           "dy": float(fit[3]), "fit_error_m": round(fit[4], 2)}
+        print("[X-Plane DSF import] raster DEM %dx%d registered against the mesh: "
+              "median error %.1f m" % (fit[0].width, fit[0].height, fit[4]))
+
     # ---- flatten pools into one vertex array; DSF triangles are clockwise seen
     # from above, so the winding is reversed to get +Z normals in Blender
     vmap = {}
@@ -1013,14 +1039,32 @@ def _import_dsf_terrain(op, context):
     tri_list = []
     face_def = []
     face_patch = []
+    filled = 0
+    no_elev = 0
     for pi, patch in enumerate(dsf.patches):
         for tri in patch.triangles:
-            idx = []
+            corners = []
+            drop = False
             for pool_i, vert_i in tri:
                 v = dsf.pools[pool_i][vert_i]
                 lon = v[0] if len(v) > 0 else 0.0
                 lat = v[1] if len(v) > 1 else 0.0
                 elev = v[2] if len(v) > 2 else 0.0
+                if elev <= DC.NO_ELEVATION_M:
+                    hv = None
+                    if fit is not None:
+                        hv = fit[0].height_at(lon, lat, bounds, fit[1], fit[2], fit[3])
+                    if hv is None:
+                        drop = True      # nothing in the file says how high this is
+                        break
+                    elev = hv
+                    filled += 1
+                corners.append((lon, lat, elev))
+            if drop:
+                no_elev += 1
+                continue
+            idx = []
+            for lon, lat, elev in corners:
                 key = (lon, lat, elev)
                 vi = vmap.get(key)
                 if vi is None:
@@ -1040,6 +1084,8 @@ def _import_dsf_terrain(op, context):
     (context.collection or context.scene.collection).objects.link(obj)
     stats["triangles"] = int(tris.shape[0])
     stats["verts"] = int(co.shape[0])
+    stats["filled_from_raster"] = int(filled)
+    stats["skipped_no_elevation"] = int(no_elev)
 
     # ---- one material per terrain definition, textures through the .ter chain
     defs = dsf.terrain_defs()
@@ -1220,6 +1266,16 @@ class IMPORT_OT_xplane_dsf(bpy.types.Operator, ImportHelper):
                                     georef["south"], georef["north"]))
         print("[X-Plane DSF import] " + info)
         self.report({"INFO"}, info)
+        if stats.get("filled_from_raster"):
+            msg = ("%d vertices carried no elevation in the mesh pools and were taken "
+                   "from the tile's own raster DEM" % stats["filled_from_raster"])
+            print("[X-Plane DSF import] " + msg)
+            self.report({"INFO"}, msg)
+        if stats.get("skipped_no_elevation"):
+            msg = ("%d triangle(s) skipped: neither the pools nor a raster DEM give "
+                   "those vertices a height" % stats["skipped_no_elevation"])
+            print("[X-Plane DSF import] " + msg)
+            self.report({"WARNING"}, msg)
         if stats["materials"]:
             msg = ("Terrain textures: %d materials textured, %d built-in (no file), "
                    "%d unresolved" % (stats["textured"], stats["builtin"],

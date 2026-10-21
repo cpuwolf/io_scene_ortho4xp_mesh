@@ -44,6 +44,37 @@ Textures are resolved through X-Plane's terrain library (`lib/g10/...`), so *X-P
 auto-detected by walking up from the `.dsf`; scenery packages that ship their own textures
 can be added in *Extra texture roots* (separated by `:` — `;` on Windows).
 
+## Vertices without an elevation come from the tile's own raster DEM
+
+X-Plane 12 writes a tile's heights **twice**: in the point pools (the mesh) and in a
+raster DEM (`DEMS` container — `DEMI` header: width, height, bytes/pixel, format, scale,
+offset; `DEMD`: the pixels). Global Scenery leaves whole LOD layers of the mesh without
+heights — raw elevation `0`, which the format's `scale 65535 / offset -32768` decodes to
+**-32768 m** — and without normals. Imported as-is those layers become a 32 km deep sheet
+under the real landscape ("flat water with the mountains floating in the sky").
+
+So the importer reads the raster too:
+
+1. every raster layer in `DEMS` is parsed (int/uint/float, 1-4 bytes per pixel);
+2. the layer that really is this tile's elevation grid is **identified by fitting it to
+   the heights the mesh already carries** — both row orders and a pixel-offset search,
+   best median error wins, and only a fit under 120 m is accepted;
+3. vertices at the `-32768 m` floor are then sampled bilinearly from that grid, with
+   edge-extend at the tile border.
+
+Measured on real tiles (`median error` = raster vs the mesh's own heights):
+
+| tile | raster used | fit median error | triangles | kept | z range after |
+|---|---|---|---|---|---|
+| `+45-111` (Yellowstone) | 1201×1201 int16 | **1.0 m** | 461,347 | all | 1233…3061 m |
+| `+28-097` (Texas coast) | 1201×1201 int16 | **0.0 m** | 266,689 | all | 0…47 m |
+| `+27+089` (Ortho4XP-built) | not needed | — | 4,577,322 | all | 445…7295 m |
+
+A file with no usable raster (or none at all, like an Ortho4XP-built DSF) still imports;
+triangles that end up without any height are skipped and reported rather than placed at
+-32768 m. The import reports both numbers: `N vertices … taken from the tile's own raster
+DEM`, and `M triangle(s) skipped` when even the raster is silent.
+
 ## Known limits
 
 * **Terrain only.** Objects, polygons and vector networks are counted in the report and
