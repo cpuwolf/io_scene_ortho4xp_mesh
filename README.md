@@ -1,8 +1,15 @@
-# Ortho4XP Mesh Import/Export (Blender extension)
+# X-Plane DSF & Ortho4XP Mesh (Blender extension)
 
-Read and write Ortho4XP tile meshes — `Data+50-125.mesh`, `Data+27+089.mesh` etc. — in
-Blender 4.2+ (tested on Blender 5.2.2 LTS, macOS), with the tile's `.ter`
-orthophotos attached on import.
+Two X-Plane tile importers in one extension, for Blender 4.2+ (tested on Blender 5.2.2 LTS,
+macOS):
+
+* **Ortho4XP `.mesh`** — read *and write* the intermediate tile mesh, e.g.
+  `Data+27+089.mesh`, with the tile's `.ter` orthophotos attached on import. This is the file
+  to edit when water cuts, coastlines or airport levelling need fixing before the tile is
+  rebuilt into a DSF.
+* **X-Plane `.dsf`** — import the terrain mesh of a *shipped* scenery tile (including the
+  7z-compressed Global Scenery files) with its terrain-type materials and textures. Import
+  only: a DSF carries layers this add-on does not model, so it is never written back.
 
 <img src="doc/previews/preview_tile.png" width="760" alt="The +27+089 tile (Paro, Bhutan) imported with its orthophotos and rendered in Blender">
 
@@ -60,6 +67,7 @@ the installed list and tick it.
 **Where it appears:**
 
 * `File → Import → Ortho4XP Mesh (.mesh)`
+* `File → Import → X-Plane DSF (terrain, .dsf)`
 * `File → Export → Ortho4XP Mesh (.mesh)`
 * 3D viewport sidebar (`N`) → tab **Ortho4XP** — tile info, triangle attributes, texture
   stats, and the *Seams from Islands* / *Fix to map* / *Projected UVs* buttons
@@ -110,6 +118,7 @@ more detail.
 | [doc/ortho4xp-mesh-format.md](doc/ortho4xp-mesh-format.md) | the `.mesh` format: MEDITS structure, both Ortho4XP flavours, units, the triangle region bit mask, the sibling `.node`/`.poly`/`.alt`/`.apt` files, editing pitfalls |
 | [doc/terrain-textures.md](doc/terrain-textures.md) | how the tile's `.ter` cells become materials + UVs, the lattice tiling, and the `tex_limit` / `tex_max_px` memory knobs |
 | [doc/import-and-export.md](doc/import-and-export.md) | every import and export option, the sidebar panel, what survives a round trip and what does not |
+| [doc/dsf-import.md](doc/dsf-import.md) | the DSF importer: 7z decoding, what is imported, the `.ter` mappings, known limits |
 | [doc/verification.md](doc/verification.md) | the `verify/` scripts, measured results on real tiles, repository layout |
 | [doc/extensions-listing.md](doc/extensions-listing.md) | the text used for the extensions.blender.org listing, kept in sync with `blender_manifest.toml` |
 | [doc/workflow-en.html](doc/workflow-en.html) | workflow diagram (English) — standalone HTML, open in a browser |

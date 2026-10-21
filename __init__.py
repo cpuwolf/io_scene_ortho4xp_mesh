@@ -148,7 +148,9 @@ import numpy as np
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
+from . import dsfcodec as DC
 from . import meshcodec as MC
+from . import tercodec as TC
 from . import terrain_tiles as TT
 
 R_EARTH = 6378137.0          # WGS84 semi-major axis, metres (matches O4_Geo_Utils)
@@ -827,6 +829,421 @@ def _import_terrain_textures(op, obj, me, m, georef):
     else:
         stats["images_over_cap"] = 0
     return stats
+
+
+
+# ------------------------------------------------------- X-Plane DSF import
+def _dsf_bounds(dsf):
+    """(west, east, south, north): the sim/* properties, else from the pools.
+
+    The bounds drive the georeference, so a DSF without them is measured from its
+    own vertices instead of being rejected.
+    """
+    b = dsf.bounds()
+    if b:
+        return b
+    lons, lats = [], []
+    for pool in dsf.pools:
+        for v in pool:
+            if len(v) > 1:
+                lons.append(v[0])
+                lats.append(v[1])
+    if not lons or not lats:
+        raise DC.DSFError("the DSF has no sim/* bounds and no terrain vertices")
+    return (min(lons), max(lons), min(lats), max(lats))
+
+
+def _dsf_texture_affine(mat, georef):
+    """Position -> UV affine for one terrain definition's material, or None.
+
+    Both .ter mappings are affine in the tile's local metres, which is what lets
+    the DSF path reuse the mesh path's UV layer and Z projection instead of
+    carrying a second implementation:
+
+        PROJECTED <x> <y>   u = (x + half_width  - offset_x) / x
+                            v = (y + half_height - offset_y) / y
+        LOAD_CENTER <lat> <lon> <m>   u = 0.5 + east/size, v = 0.5 + north/size
+    """
+    pj = mat.get("dsf_ter_projected")
+    if pj:
+        try:
+            xs, ys, ox, oy = (float(v) for v in json.loads(pj))
+        except Exception:                                      # noqa: BLE001
+            return None
+        if xs == 0.0 or ys == 0.0:
+            return None
+        hw = (float(georef["east"]) - float(georef["west"])) * 0.5 * georef["m_per_deg_lon"]
+        hh = (float(georef["north"]) - float(georef["south"])) * 0.5 * georef["m_per_deg_lat"]
+        return (1.0 / xs, (hw - ox) / xs, 1.0 / ys, (hh - oy) / ys)
+    lc = mat.get("dsf_ter_center")
+    if lc:
+        try:
+            lat, lon, size = json.loads(lc)[:3]
+        except Exception:                                      # noqa: BLE001
+            return None
+        try:
+            return TT.center_uv_affine(lat, lon, size, georef)
+        except Exception:                                      # noqa: BLE001
+            return None
+    return None
+
+
+def _apply_dsf_texture(mat, resolver, entry, max_px=0, affine=None, zproj=True):
+    """Wire the .ter (or bitmap) a terrain definition points at into a material.
+
+    Returns True when a base texture was attached.  The .ter's other layers are
+    loaded as labelled but unconnected nodes: compositing and night lighting need
+    the per-vertex blend parameter that lives in DSF pool planes 5+, which a
+    Blender mesh does not carry, so inventing a factor would be a lie.
+    """
+    ter, kind, img_path = resolver.load(entry)
+    if kind == "builtin":
+        # e.g. terrain_Water -- rendered internally by X-Plane, no file on disk
+        mat["dsf_ter_kind"] = "builtin"
+        return False
+    if kind == "image":
+        mat["dsf_ter_kind"] = "image"
+        mat["dsf_ter_textures"] = json.dumps({"base": img_path})
+        base = img_path
+    elif kind == "ter" and ter is not None:
+        mat["dsf_ter_kind"] = "ter"
+        mat["dsf_ter_path"] = ter.path
+        mat["dsf_ter_textures"] = json.dumps(ter.textures)
+        proj = ter.params("PROJECTED", 2)
+        if proj:
+            ox = oy = 0.0
+            ov = ter.directive("PROJECT_OFFSET")
+            if ov and len(ov) >= 3:
+                try:
+                    ox = float(ov[1].replace(",", "."))
+                    oy = float(ov[2].replace(",", "."))
+                except ValueError:
+                    ox = oy = 0.0
+            mat["dsf_ter_projected"] = json.dumps([proj[0], proj[1], ox, oy])
+        else:
+            lc = ter.params("LOAD_CENTER", 4)
+            if lc:
+                mat["dsf_ter_center"] = json.dumps(lc)
+            lb = ter.params("LOAD_CENTER_BORDER", 4)
+            if lb:
+                mat["dsf_ter_center_border"] = json.dumps(lb)
+        if ter.directive("PROJECT_ANGLE"):
+            mat["dsf_ter_angle"] = json.dumps(ter.directive("PROJECT_ANGLE")[1:])
+        mat["dsf_ter_nowrap"] = bool(
+            ter.has("BASE_TEX_NOWRAP") or ter.has("LIT_TEX_NOWRAP")
+            or "dsf_ter_center" in mat)
+        base = ter.texture_abs("base") or ter.texture_abs("other")
+    else:
+        mat["dsf_ter_kind"] = "unresolved"
+        return False
+
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    out.location = (540, 0)
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (240, 0)
+    nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    try:
+        bsdf.inputs["Roughness"].default_value = 1.0
+    except Exception:                                          # noqa: BLE001
+        pass
+
+    x = -560
+    base_img = _load_image(base, max_px)
+    if base_img is not None:
+        base_img.colorspace_settings.name = "sRGB"
+        node = nt.nodes.new("ShaderNodeTexImage")
+        node.location = (x, 140)
+        node.label = "BASE_TEX"
+        node.image = base_img
+        node.extension = "EXTEND" if mat.get("dsf_ter_nowrap") else "REPEAT"
+        nt.links.new(node.outputs["Color"], bsdf.inputs["Base Color"])
+
+    if kind == "ter" and ter is not None:
+        n_img = _load_image(ter.texture_abs("normal"), max_px)
+        if n_img is not None:
+            n_img.colorspace_settings.name = "Non-Color"
+            node = nt.nodes.new("ShaderNodeTexImage")
+            node.location = (x, -160)
+            node.label = "NORMAL_TEX"
+            node.image = n_img
+            nmap = nt.nodes.new("ShaderNodeNormalMap")
+            nmap.location = (x + 280, -160)
+            nt.links.new(node.outputs["Color"], nmap.inputs["Color"])
+            nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+        for role, y in (("lit", -420), ("composite", -640), ("border", -860)):
+            r_img = _load_image(ter.texture_abs(role), max_px)
+            if r_img is None:
+                continue
+            r_img.colorspace_settings.name = "sRGB"
+            node = nt.nodes.new("ShaderNodeTexImage")
+            node.location = (x, y)
+            node.label = role.upper() + "_TEX (imported, not blended)"
+            node.image = r_img
+
+    if zproj and affine is not None:
+        _wire_material_zproject(mat, affine)
+    if max_px:
+        for n in nt.nodes:
+            if n.type == "TEX_IMAGE" and n.image is not None:
+                _cap_image(n.image, max_px)
+    return base_img is not None
+
+
+def _import_dsf_terrain(op, context):
+    """Build the tile's terrain mesh from a DSF (the .dsf import operator's work)."""
+    dsf = DC.load_dsf(op.filepath)
+    west, east, south, north = _dsf_bounds(dsf)
+    georef = _georef_from_bounds(west, east, south, north)
+    name = os.path.splitext(os.path.basename(op.filepath))[0]
+
+    stats = {"file": op.filepath, "compressed": bool(dsf.was_compressed),
+             "patches": len(dsf.patches), "triangles": 0, "verts": 0,
+             "defs": len(dsf.terrain_defs()), "defs_used": 0, "materials": 0,
+             "textured": 0, "builtin": 0, "unresolved": 0, "unresolved_list": [],
+             "uv_layer": None, "uv_mapped": 0, "max_px": int(op.tex_max_px),
+             "zproj": bool(op.zproj), "unhandled": dict(dsf.unhandled)}
+
+    # ---- flatten pools into one vertex array; DSF triangles are clockwise seen
+    # from above, so the winding is reversed to get +Z normals in Blender
+    vmap = {}
+    co_list = []
+    tri_list = []
+    face_def = []
+    face_patch = []
+    for pi, patch in enumerate(dsf.patches):
+        for tri in patch.triangles:
+            idx = []
+            for pool_i, vert_i in tri:
+                v = dsf.pools[pool_i][vert_i]
+                lon = v[0] if len(v) > 0 else 0.0
+                lat = v[1] if len(v) > 1 else 0.0
+                elev = v[2] if len(v) > 2 else 0.0
+                key = (lon, lat, elev)
+                vi = vmap.get(key)
+                if vi is None:
+                    vi = vmap[key] = len(co_list)
+                    co_list.append(_geo_to_blender(georef, lon, lat, elev))
+                idx.append(vi)
+            tri_list.append((idx[2], idx[1], idx[0]))
+            face_def.append(patch.definition)
+            face_patch.append(pi)
+    if not tri_list:
+        raise DC.DSFError("no terrain mesh in this DSF (nothing to import)")
+
+    co = np.asarray(co_list, dtype=np.float64).reshape(-1, 3)
+    tris = np.asarray(tri_list, dtype=np.int32).reshape(-1, 3)
+    me = _new_vertex_mesh(name, co, tris)
+    obj = bpy.data.objects.new(name, me)
+    (context.collection or context.scene.collection).objects.link(obj)
+    stats["triangles"] = int(tris.shape[0])
+    stats["verts"] = int(co.shape[0])
+
+    # ---- one material per terrain definition, textures through the .ter chain
+    defs = dsf.terrain_defs()
+    resolver = None
+    if op.import_materials and op.import_textures:
+        extra = [p for p in op.extra_tex_roots.split(os.pathsep) if p.strip()]
+        try:
+            resolver = TC.TerResolver(op.filepath,
+                                      xp_root=op.xp_root.strip() or None,
+                                      extra_roots=extra)
+            print("[X-Plane DSF import] x-plane root: %s; %d library prefixes"
+                  % (resolver.xp_root, len(resolver.prefixes)))
+        except Exception as ex:                                # noqa: BLE001
+            resolver = None
+            print("[X-Plane DSF import] cannot resolve terrain textures: %s" % ex)
+
+    slot_of = {}
+    slot_affine = []
+    unresolved = []
+    if op.import_materials:
+        for di in sorted(set(face_def)):
+            path = defs[di] if di < len(defs) else "<terrain %d>" % di
+            mat = bpy.data.materials.new("dsf_terrain_%d" % di)
+            mat["dsf_def_index"] = di
+            mat["dsf_def_path"] = path
+            if resolver is not None:
+                if _apply_dsf_texture(mat, resolver, path, int(op.tex_max_px), None,
+                                      False):
+                    stats["textured"] += 1
+                elif mat.get("dsf_ter_kind") == "builtin":
+                    stats["builtin"] += 1
+                else:
+                    stats["unresolved"] += 1
+                    unresolved.append(path)
+            affine = _dsf_texture_affine(mat, georef)
+            if affine is not None and bool(op.zproj):
+                _wire_material_zproject(mat, affine)
+            slot_of[di] = len(obj.data.materials)
+            slot_affine.append(affine)
+            obj.data.materials.append(mat)
+        slot = np.zeros(len(me.polygons), dtype=np.int32)
+        def_arr = np.asarray(face_def, dtype=np.int32)
+        for di, idx in slot_of.items():
+            slot[def_arr == di] = idx
+        me.polygons.foreach_set("material_index", slot)
+        stats["materials"] = len(obj.data.materials)
+        stats["defs_used"] = len(slot_of)
+        stats["unresolved_list"] = sorted(set(unresolved))[:40]
+
+    # ---- UVs: the same affine machinery the .mesh importer writes and projects
+    if op.import_uvs and slot_of:
+        uv_stats = _write_uv_layer(me, slot_affine)
+        obj["dsf_uv_layer"] = uv_stats["layer"]
+        stats["uv_layer"] = uv_stats["layer"]
+        stats["uv_mapped"] = uv_stats["mapped"]
+        for m in obj.data.materials:
+            if m is not None and m.get("dsf_ter_nowrap"):
+                for n in m.node_tree.nodes:
+                    if n.type == "TEX_IMAGE":
+                        n.extension = "EXTEND"
+        if op.mark_seams and uv_stats["layer"]:
+            stats["seams"] = _mark_seams_from_islands(me, uv_stats["layer"])
+
+    _add_face_attr(me, "dsf_patch", face_patch)
+    if op.smooth:
+        flags = np.ones(len(me.polygons), dtype=bool)
+        me.polygons.foreach_set("use_smooth", flags)
+
+    # ---- metadata: enough to know what was imported, nothing that pretends a
+    # DSF can be written back from Blender (it cannot: there is no exporter)
+    obj["dsf_georef"] = json.dumps(georef)
+    obj["dsf_props"] = json.dumps([[k, v] for k, v in dsf.props
+                                   if not k.startswith("_dsf/")])
+    obj["dsf_defn"] = json.dumps(dsf.defn)
+    obj["dsf_patches"] = json.dumps(
+        [{"definition": p.definition, "flags": p.flags,
+          "lod_near": p.lod_near, "lod_far": p.lod_far} for p in dsf.patches])
+    obj["dsf_source"] = op.filepath
+    obj["dsf_stats"] = json.dumps(stats)
+    return obj, me, dsf, georef, stats
+
+
+class IMPORT_OT_xplane_dsf(bpy.types.Operator, ImportHelper):
+    """Import the terrain mesh of an X-Plane DSF scenery file"""
+    bl_idname = "import_scene.xplane_dsf"
+    bl_label = "Import X-Plane DSF"
+    bl_options = {"UNDO"}
+
+    filename_ext = ".dsf"
+    filter_glob: StringProperty(default="*.dsf", options={"HIDDEN"})
+
+    import_materials: BoolProperty(
+        name="Material per terrain definition",
+        description="Give every terrain definition (the DSF's TERT table) its own "
+                    "material slot, so the ground the sim renders per type is "
+                    "visible in Blender",
+        default=True,
+    )
+    import_textures: BoolProperty(
+        name="Terrain textures (.ter)",
+        description="Resolve each terrain definition to its .ter (or bitmap) and "
+                    "load its BASE_TEX / NORMAL_TEX into the material. Built-in "
+                    "types such as terrain_Water have no file on disk and are "
+                    "reported separately",
+        default=True,
+    )
+    import_uvs: BoolProperty(
+        name="UVs from the .ter mapping",
+        description="Write one UV layer from each terrain type's .ter — the "
+                    "PROJECTED metres-per-texture scale, or its LOAD_CENTER "
+                    "footprint. Without it the textures have no UVs to sample",
+        default=True,
+    )
+    xp_root: StringProperty(
+        name="X-Plane root",
+        description="Folder containing 'Resources/default scenery', used to resolve "
+                    "the DSF's lib/... terrain references. Leave empty to walk up "
+                    "from the .dsf",
+        default="", subtype="DIR_PATH",
+    )
+    extra_tex_roots: StringProperty(
+        name="Extra texture roots",
+        description="Optional; separated by ':' (';' on Windows). Additional folders "
+                    "searched for terrain textures, for scenery packages that ship "
+                    "their own",
+        default="",
+    )
+    tex_max_px: IntProperty(
+        name="Max texture size", default=2048, min=0, max=8192,
+        description="Decode each terrain texture and downscale it to at most this "
+                    "many pixels (0 = native size). A DSF tile references dozens of "
+                    "terrain types, and X-Plane's own textures are 1024-4096 px",
+    )
+    zproj: BoolProperty(
+        name="Project textures along Z (fixed map)", default=True,
+        description="Feed each texture from a Z projection of the vertex positions "
+                    "instead of the baked UV layer, so the ground texture stays "
+                    "nailed to the map while vertices move — the same behaviour the "
+                    ".mesh importer offers",
+    )
+    smooth: BoolProperty(name="Smooth shading", default=True,
+                         description="Shade the terrain smooth (it looks faceted "
+                                     "otherwise)")
+    mark_seams: BoolProperty(
+        name="Seams from UV islands", default=False,
+        description="Mark the borders between terrain-type UV islands as seams. Off "
+                    "by default: a DSF tile has hundreds of terrain types and the "
+                    "edge sort costs seconds on a 500k-triangle tile",
+    )
+    report_unhandled: BoolProperty(
+        name="Report skipped content", default=True,
+        description="List the objects / polygons / vector networks / raster layers "
+                    "that were parsed but not imported (out of scope: this add-on "
+                    "imports the terrain mesh)",
+    )
+
+    def execute(self, context):
+        try:
+            obj, me, dsf, georef, stats = _import_dsf_terrain(self, context)
+        except DC.DSFError as ex:
+            self.report({"ERROR"}, "DSF: %s" % ex)
+            return {"CANCELLED"}
+        except Exception as ex:                                # noqa: BLE001
+            traceback.print_exc()
+            self.report({"ERROR"}, "Failed to read %s: %s"
+                        % (os.path.basename(self.filepath), ex))
+            return {"CANCELLED"}
+
+        for o in context.view_layer.objects:
+            o.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+        info = ("DSF %s%s: %d triangles, %d patches, %d terrain defs, lon %.6f..%.6f "
+                "lat %.6f..%.6f" % (obj.name, " [7z]" if stats["compressed"] else "",
+                                    stats["triangles"], stats["patches"],
+                                    stats["defs"], georef["west"], georef["east"],
+                                    georef["south"], georef["north"]))
+        print("[X-Plane DSF import] " + info)
+        self.report({"INFO"}, info)
+        if stats["materials"]:
+            msg = ("Terrain textures: %d materials textured, %d built-in (no file), "
+                   "%d unresolved" % (stats["textured"], stats["builtin"],
+                                      stats["unresolved"]))
+            print("[X-Plane DSF import] " + msg)
+            self.report({"INFO"}, msg)
+            if stats["unresolved_list"]:
+                print("[X-Plane DSF import] unresolved terrain types: "
+                      + ", ".join(stats["unresolved_list"][:10]))
+        if stats.get("uv_layer"):
+            print("[X-Plane DSF import] UV layer '%s' on %d loops"
+                  % (stats["uv_layer"], stats["uv_mapped"]))
+        if self.report_unhandled and dsf.unhandled:
+            names = {7: "objects", 8: "object-ranges", 9: "network chains",
+                     10: "network ranges", 11: "network chains32",
+                     12: "polygons", 13: "polygon-ranges", 14: "nested polygons",
+                     15: "nested polygon ranges", 32: "comments", 33: "comments",
+                     34: "comments"}
+            parts = ["%d %s" % (dsf.unhandled[c], names.get(c, "cmd %d" % c))
+                     for c in sorted(dsf.unhandled)]
+            msg = "Not imported (terrain only): " + ", ".join(parts)
+            print("[X-Plane DSF import] " + msg)
+            self.report({"INFO"}, msg)
+        return {"FINISHED"}
 
 
 # --------------------------------------------------------------- import
@@ -1565,6 +1982,7 @@ class MESH_PT_ortho4xp_panel(bpy.types.Panel):
 
 # --------------------------------------------------------------- registration
 CLASSES = (IMPORT_OT_ortho4xp_mesh, EXPORT_OT_ortho4xp_mesh,
+           IMPORT_OT_xplane_dsf,
            MESH_OT_zproject, MESH_OT_reproject_uvs,
            MESH_OT_seams_from_islands, MESH_PT_ortho4xp_panel)
 
@@ -1572,6 +1990,8 @@ CLASSES = (IMPORT_OT_ortho4xp_mesh, EXPORT_OT_ortho4xp_mesh,
 def _menu_import(self, context):
     self.layout.operator(IMPORT_OT_ortho4xp_mesh.bl_idname,
                          text="Ortho4XP Mesh (.mesh)")
+    self.layout.operator(IMPORT_OT_xplane_dsf.bl_idname,
+                         text="X-Plane DSF (terrain, .dsf)")
 
 
 def _menu_export(self, context):
