@@ -68,6 +68,11 @@ the installed list and tick it.
 
 * `File → Import → Ortho4XP Mesh (.mesh)`
 * `File → Import → X-Plane DSF (terrain, .dsf)`
+* `File → Import → X-Plane apt.dat (pavement, .dat)` — the airport's taxiway/apron
+  boundaries from apt.dat 12.00. Independent of the DSF importer: give airport
+  identifiers (or import a whole apt.dat) and the pavement is placed at each airport's
+  own elevation; if a DSF tile is in the scene the same pavements are draped onto its
+  terrain instead
 * `File → Export → Ortho4XP Mesh (.mesh)`
 * 3D viewport sidebar (`N`) → tab **Ortho4XP** — tile info, triangle attributes, texture
   stats, and the *Seams from Islands* / *Fix to map* / *Projected UVs* buttons

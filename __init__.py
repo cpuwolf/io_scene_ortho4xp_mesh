@@ -145,9 +145,11 @@ import traceback
 
 import bpy
 import numpy as np
+from mathutils import Vector
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
+from . import aptcodec as AC
 from . import dsfcodec as DC
 from . import meshcodec as MC
 from . import tercodec as TC
@@ -1171,6 +1173,322 @@ def _import_dsf_terrain(op, context):
     return obj, me, dsf, georef, stats
 
 
+# ------------------------------------------------------- apt.dat pavements
+def _apt_dat_path(op, dsf_path, xp_root):
+    """Where apt.dat is: the operator's choice, next to the .dsf, or Global Airports."""
+    if (op.apt_dat or "").strip():
+        return os.path.expanduser(op.apt_dat.strip()), "chosen"
+    here = os.path.dirname(os.path.abspath(dsf_path))
+    for cand in (os.path.join(here, "apt.dat"),
+                 os.path.join(os.path.dirname(here), "apt.dat")):
+        if os.path.isfile(cand):
+            return cand, "next to the .dsf"
+    root = (xp_root or "").strip()
+    if not root:
+        # walk up looking for the X-Plane root (it has Resources/default scenery)
+        d = here
+        for _ in range(6):
+            if os.path.isdir(os.path.join(d, "Resources", "default scenery")):
+                root = d
+                break
+            d = os.path.dirname(d)
+    if root:
+        cand = os.path.join(root, "Global Scenery", "Global Airports",
+                            "Earth nav data", "apt.dat")
+        if os.path.isfile(cand):
+            return cand, "Global Airports"
+    return None, "not found"
+
+
+def _subdivide(tri, max_edge, depth=0):
+    """Split a triangle (three (x, y) points) until its longest edge is <= max_edge.
+
+    The pavement has to follow the terrain's curvature, not just its outline: a
+    boundary-only polygon would be one flat sheet across a hillside.
+    """
+    a, b, c = tri
+    d_ab = math.dist(a, b)
+    d_bc = math.dist(b, c)
+    d_ca = math.dist(c, a)
+    longest = max(d_ab, d_bc, d_ca)
+    # stop on AREA, not on edge length: an ear of a long concave apron is a sliver
+    # with a huge edge and a small area, and splitting it by edge length alone
+    # produced tens of thousands of triangles for one grass strip.  The edge guard
+    # keeps a leftover sliver from spanning a hillside.
+    area = abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) * 0.5
+    if depth >= 6 or (area <= max_edge * max_edge and longest <= 5.0 * max_edge):
+        return [tri]
+    ab = ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
+    bc = ((b[0] + c[0]) * 0.5, (b[1] + c[1]) * 0.5)
+    ca = ((c[0] + a[0]) * 0.5, (c[1] + a[1]) * 0.5)
+    out = []
+    out += _subdivide((a, ab, ca), max_edge, depth + 1)
+    out += _subdivide((ab, b, bc), max_edge, depth + 1)
+    out += _subdivide((ca, bc, c), max_edge, depth + 1)
+    out += _subdivide((ab, bc, ca), max_edge, depth + 1)
+    return out
+
+
+def _terrain_tile_for_pavements(context):
+    """The DSF-imported tile in the scene as (object, georef, bounds), or None."""
+    best = None
+    for o in context.scene.objects:
+        if o.type != "MESH":
+            continue
+        # both importers store the same georeference struct, under their own key:
+        # a DSF tile has dsf_georef, an Ortho4XP .mesh tile has mesh_georef
+        stored = o.get("dsf_georef") or o.get("mesh_georef")
+        if not stored:
+            continue
+        try:
+            geo = json.loads(stored)
+        except Exception:                                      # noqa: BLE001
+            continue
+        if best is None or len(o.data.polygons) > len(best[0].data.polygons):
+            best = (o, geo, (geo["west"], geo["east"], geo["south"], geo["north"]))
+    return best
+
+
+def _build_pavement_mesh(name, pavs, elev_by_id, georef, terrain_obj, step, lift):
+    """Drape the pavement boundaries, returning ``(object, stats)``.
+
+    With a terrain object every vertex is ray-cast onto it, so the pavement follows
+    the surface's curvature.  Without one (apt.dat imported on its own) the pavement
+    is placed at the airport's own elevation from apt.dat row 1, i.e. flat, which is
+    what the file itself says.
+    """
+    stats = {"pavements": 0, "triangles": 0, "verts": 0, "unplaced": 0,
+             "draped": terrain_obj is not None, "terrain": None}
+    bvh = None
+    if terrain_obj is not None:
+        from mathutils.bvhtree import BVHTree
+        me = terrain_obj.data
+        co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+        me.vertices.foreach_get("co", co)
+        verts = [tuple(co[i:i + 3]) for i in range(0, len(co), 3)]
+        bvh = BVHTree.FromPolygons(verts, [tuple(p.vertices) for p in me.polygons],
+                                  all_triangles=False, epsilon=0.0)
+        stats["terrain"] = terrain_obj.name
+
+    def surface_z(x, y, flat_z):
+        if bvh is None:
+            return flat_z
+        hit, _n, _i, _d = bvh.ray_cast(Vector((x, y, 20000.0)),
+                                       Vector((0.0, 0.0, -1.0)), 80000.0)
+        return hit.z if hit is not None else None
+
+    slot_of = {}
+    all_verts, all_faces, face_slot = [], [], []
+    for pav in pavs:
+        boundary = pav.boundary_m(georef, step)
+        if len(boundary) < 3:
+            continue
+        tris = AC.ear_clip(boundary)
+        if not tris:
+            continue
+        flat_z = elev_by_id.get(pav.airport, 0.0)
+        base = len(all_verts)
+        index, local = {}, []
+
+        def add(pt):
+            key = (round(pt[0], 2), round(pt[1], 2))
+            i = index.get(key)
+            if i is None:
+                z = surface_z(pt[0], pt[1], flat_z)
+                if z is None:
+                    return None
+                i = index[key] = base + len(local)
+                local.append((pt[0], pt[1], z + lift))
+            return i
+
+        for tri in tris:
+            for piece in _subdivide((boundary[tri[0]], boundary[tri[1]],
+                                    boundary[tri[2]]), step * 1.6):
+                ia, ib, ic = (add(piece[0]), add(piece[1]), add(piece[2]))
+                if ia is None or ib is None or ic is None:
+                    stats["unplaced"] += 1
+                    continue
+                if ia == ib or ib == ic or ic == ia:
+                    continue
+                q0, q1, q2 = piece
+                if abs((q1[0] - q0[0]) * (q2[1] - q0[1])
+                       - (q2[0] - q0[0]) * (q1[1] - q0[1])) < 0.05:
+                    continue                        # sliver, no surface to see
+                if pav.surface not in slot_of:
+                    slot_of[pav.surface] = len(slot_of)
+                all_faces.append((ia, ib, ic))
+                face_slot.append(slot_of[pav.surface])
+        all_verts.extend(local)
+        stats["pavements"] += 1
+
+    if not all_faces:
+        return None, stats
+
+    me = bpy.data.meshes.new(name)
+    me.from_pydata([tuple(v) for v in all_verts], [], [tuple(f) for f in all_faces])
+    me.update()
+    obj = bpy.data.objects.new(name, me)
+    (bpy.context.collection or bpy.context.scene.collection).objects.link(obj)
+    for surface, _slot in sorted(slot_of.items(), key=lambda kv: kv[1]):
+        mat = bpy.data.materials.new("apt_%d_%s"
+                                     % (surface,
+                                        AC.surface_name(surface).replace(" ", "_")))
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        colour = AC.surface_color(surface)
+        if bsdf is not None:
+            bsdf.inputs["Base Color"].default_value = (*colour, 1.0)
+            try:
+                bsdf.inputs["Roughness"].default_value = 0.85
+            except Exception:                                  # noqa: BLE001
+                pass
+        mat.diffuse_color = (*colour, 1.0)
+        me.materials.append(mat)
+    me.polygons.foreach_set("material_index", np.asarray(face_slot, dtype=np.int32))
+    me.polygons.foreach_set("use_smooth", np.ones(len(me.polygons), dtype=bool))
+    stats["verts"] = len(all_verts)
+    stats["triangles"] = len(all_faces)
+    return obj, stats
+
+
+def _pavement_bounds(pavs):
+    """lon/lat box of the given pavements (used when there is no terrain tile)."""
+    lons, lats = [], []
+    for pav in pavs:
+        for lat, lon in pav.ring:
+            lons.append(lon)
+            lats.append(lat)
+    if not lons:
+        return None
+    return (min(lons), max(lons), min(lats), max(lats))
+
+
+class IMPORT_OT_xplane_apt(bpy.types.Operator, ImportHelper):
+    """Import airport pavement boundaries from an apt.dat file"""
+    bl_idname = "import_scene.xplane_apt"
+    bl_label = "Import X-Plane apt.dat (pavement)"
+    bl_options = {"UNDO"}
+
+    filename_ext = ".dat"
+    filter_glob: StringProperty(default="*.dat", options={"HIDDEN"})
+
+    airports: StringProperty(
+        name="Airports", default="",
+        description="Comma-separated airport identifiers to import (KLVM, 29S, ...). "
+                    "Leave empty to take the airports inside the scene's tile (DSF or "
+                    ".mesh), or every airport in the file when there is no tile",
+    )
+    use_tile: BoolProperty(
+        name="Use the scene's tile", default=True,
+        description="When a tile is in the scene (a DSF import or an Ortho4XP .mesh "
+                    "import), take the airports inside it and drape the pavement onto "
+                    "its terrain. Off, or with no tile, the pavement is placed flat at "
+                    "each airport's own elevation — apt.dat does not need a terrain "
+                    "import to work",
+    )
+    step_m: FloatProperty(
+        name="Grid (m)", default=20.0, min=2.0, max=200.0,
+        description="Target edge length: smaller follows the terrain more closely and "
+                    "costs more triangles",
+    )
+    max_airports: IntProperty(
+        name="Airport limit", default=200, min=1, max=100000,
+        description="Safety valve: without identifiers and without a tile, refuse a "
+                    "file that holds more airports than this instead of building "
+                    "thousands of pavements (the full worldwide apt.dat has ~40,000)",
+    )
+    lift_m: FloatProperty(
+        name="Lift (m)", default=0.12, min=0.0, max=5.0,
+        description="Height above the surface so the pavement is visible instead of "
+                    "z-fighting with it",
+    )
+
+    def execute(self, context):
+        # The DSF tile is a convenience, never a requirement: with one in the scene the
+        # pavements are draped on its terrain and its bounds pick the airports, without
+        # one they are placed flat at each airport's own apt.dat elevation.
+        tile = _terrain_tile_for_pavements(context)
+        ids = {s.strip().upper() for s in self.airports.replace(";", ",").split(",")
+               if s.strip()}
+        if ids:
+            bounds = (-180.0, 180.0, -90.0, 90.0)
+        elif tile is not None and self.use_tile:
+            bounds = tile[2]
+        else:
+            bounds = (-180.0, 180.0, -90.0, 90.0)
+            print("[apt.dat import] no airport identifiers and no tile in the scene: "
+                  "importing every airport in the file")
+        try:
+            pavs, airports = AC.read_pavements(self.filepath, bounds, ids=ids or None)
+        except Exception as ex:                                # noqa: BLE001
+            traceback.print_exc()
+            self.report({"ERROR"}, "apt.dat: %s" % ex)
+            return {"CANCELLED"}
+        if ids:
+            pavs = [p for p in pavs if p.airport.upper() in ids]
+            airports = [a for a in airports if a[0].upper() in ids]
+        if not ids and tile is None and len(airports) > int(self.max_airports):
+            self.report({"ERROR"},
+                        "%s holds %d airports and no identifier was given — list the "
+                        "ones you want (e.g. KLVM) or import the tile first"
+                        % (os.path.basename(self.filepath), len(airports)))
+            return {"CANCELLED"}
+        if not pavs:
+            self.report({"WARNING"}, "no pavement for %s in %s"
+                        % (sorted(ids) or "this tile", os.path.basename(self.filepath)))
+            return {"CANCELLED"}
+        elev = {a[0]: (a[2] or 0.0) * 0.3048 for a in airports}
+        box = _pavement_bounds(pavs)
+        if box is None:
+            self.report({"WARNING"}, "the pavements have no boundary to place")
+            return {"CANCELLED"}
+        # drape only when the tile is in the scene *and* these pavements lie inside it;
+        # otherwise the tile's coordinate frame would put them in the wrong place
+        use_terrain = False
+        if tile is not None and self.use_tile:
+            tw, te, ts, tn = tile[2]
+            use_terrain = (box[0] >= tw - 0.02 and box[1] <= te + 0.02
+                           and box[2] >= ts - 0.02 and box[3] <= tn + 0.02)
+            if not use_terrain:
+                print("[apt.dat import] the pavement lies outside %s; placing it flat"
+                      % tile[0].name)
+        if use_terrain:
+            georef = tile[1]
+            terrain = tile[0]
+            name = terrain.name + "_pavement"
+        else:
+            georef = _georef_from_bounds(box[0] - 0.001, box[1] + 0.001,
+                                         box[2] - 0.001, box[3] + 0.001)
+            terrain = None
+            name = "apt_pavement"
+        try:
+            obj, stats = _build_pavement_mesh(name, pavs, elev, georef, terrain,
+                                              max(2.0, float(self.step_m)),
+                                              float(self.lift_m))
+        except Exception as ex:                                # noqa: BLE001
+            traceback.print_exc()
+            self.report({"ERROR"}, "pavement: %s" % ex)
+            return {"CANCELLED"}
+        if obj is None:
+            self.report({"WARNING"}, "pavement boundaries found but none could be "
+                                     "placed (%d unplaced)" % stats["unplaced"])
+            return {"CANCELLED"}
+        obj["apt_dat"] = self.filepath
+        obj["apt_airports"] = json.dumps(sorted({p.airport for p in pavs}))
+        msg = ("Pavement: %d chunk(s) from %d airport(s) — %d triangles, %s"
+               % (stats["pavements"], len({p.airport for p in pavs}),
+                  stats["triangles"],
+                  ("draped on %s" % stats["terrain"]) if stats["draped"]
+                  else "flat at each airport's elevation"))
+        print("[apt.dat import] " + msg)
+        self.report({"INFO"}, msg)
+        for o in context.view_layer.objects:
+            o.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        return {"FINISHED"}
+
+
 class IMPORT_OT_xplane_dsf(bpy.types.Operator, ImportHelper):
     """Import the terrain mesh of an X-Plane DSF scenery file"""
     bl_idname = "import_scene.xplane_dsf"
@@ -2041,7 +2359,7 @@ class MESH_PT_ortho4xp_panel(bpy.types.Panel):
 
 # --------------------------------------------------------------- registration
 CLASSES = (IMPORT_OT_ortho4xp_mesh, EXPORT_OT_ortho4xp_mesh,
-           IMPORT_OT_xplane_dsf,
+           IMPORT_OT_xplane_dsf, IMPORT_OT_xplane_apt,
            MESH_OT_zproject, MESH_OT_reproject_uvs,
            MESH_OT_seams_from_islands, MESH_PT_ortho4xp_panel)
 
@@ -2051,6 +2369,8 @@ def _menu_import(self, context):
                          text="Ortho4XP Mesh (.mesh)")
     self.layout.operator(IMPORT_OT_xplane_dsf.bl_idname,
                          text="X-Plane DSF (terrain, .dsf)")
+    self.layout.operator(IMPORT_OT_xplane_apt.bl_idname,
+                         text="X-Plane apt.dat (pavement, .dat)")
 
 
 def _menu_export(self, context):
