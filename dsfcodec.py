@@ -444,12 +444,27 @@ class Patch:
 
 
 @dataclass
+class Polygon:
+    """One polygon / facade / forest / line primitive from the DSF.
+
+    ``rings`` holds one list per winding, each a list of (lon, lat) in degrees; the
+    first winding is the outline, the rest are holes. ``param`` is the per-polygon
+    16-bit parameter, whose meaning belongs to the definition (class), not to us.
+    """
+    definition: int = 0
+    klass: str = ""
+    param: int = 0
+    rings: list = field(default_factory=list)
+
+
+@dataclass
 class DSF:
     props: list = field(default_factory=list)          # ordered [(k, v), ...]
     defn: dict = field(default_factory=dict)           # atom name -> [paths]
     pools: list = field(default_factory=list)          # decoded vertex tuples
     pool_scales: list = field(default_factory=list)    # per pool: [(scale,offset)]
     patches: list = field(default_factory=list)        # Patch objects
+    polygons: list = field(default_factory=list)       # Polygon objects
     unhandled: dict = field(default_factory=dict)      # cmd id -> count
     source_path: str | None = None
     was_compressed: bool = False
@@ -579,6 +594,7 @@ def _parse_commands(dsf: DSF, raw, s, e):
     lod_near = -1.0
     lod_far = -1.0
     cur_patch = None
+    raw_polys = []
     unhandled = dsf.unhandled
 
     def close_patch():
@@ -643,23 +659,47 @@ def _parse_commands(dsf: DSF, raw, s, e):
             o += 4 * n
             unhandled[cid] = unhandled.get(cid, 0) + 1
         elif cid == C_POLYGON:
-            n = raw[o + 2]
-            o += 3 + 2 * n
-            unhandled[cid] = unhandled.get(cid, 0) + 1
+            # u16 param, u8 count, count x u16 index
+            param, o = _u16(raw, o)
+            n, o = _u8(raw, o)
+            ring = []
+            for _ in range(n):
+                idx, o = _u16(raw, o)
+                ring.append((cur_pool, idx))
+            raw_polys.append((cur_def, param, [ring]))
         elif cid == C_POLYGON_RANGE:
-            o += 6
-            unhandled[cid] = unhandled.get(cid, 0) + 1
+            # u16 param, u16 first index, u16 last index + 1
+            param, o = _u16(raw, o)
+            first, o = _u16(raw, o)
+            after, o = _u16(raw, o)
+            raw_polys.append((cur_def, param,
+                              [[(cur_pool, i) for i in range(first, after)]]))
         elif cid == C_NESTED_POLYGON:
-            nw = raw[o + 2]
-            o += 3
+            # u16 param, u8 winding count, then per winding: u8 count + indices
+            param, o = _u16(raw, o)
+            nw, o = _u8(raw, o)
+            rings = []
             for _ in range(nw):
-                k = raw[o]
-                o += 1 + 2 * k
-            unhandled[cid] = unhandled.get(cid, 0) + 1
+                k, o = _u8(raw, o)
+                ring = []
+                for _ in range(k):
+                    idx, o = _u16(raw, o)
+                    ring.append((cur_pool, idx))
+                rings.append(ring)
+            raw_polys.append((cur_def, param, rings))
         elif cid == C_NESTED_POLYGON_RANGE:
-            n = raw[o + 2]
-            o += 5 + 2 * n           # u16 param, u8 count, u16 index1, N*u16
-            unhandled[cid] = unhandled.get(cid, 0) + 1
+            # u16 param, u8 number of windings, then (windings + 1) x u16 index: each
+            # index starts a winding except the last, one past the last point.
+            # Checked against the file: count 2 is followed by three indices.
+            param, o = _u16(raw, o)
+            nw, o = _u8(raw, o)
+            starts = []
+            for _ in range(nw + 1):
+                idx, o = _u16(raw, o)
+                starts.append(idx)
+            rings = [[(cur_pool, i) for i in range(starts[k], starts[k + 1])]
+                     for k in range(max(0, len(starts) - 1))]
+            raw_polys.append((cur_def, param, rings))
         elif cid == C_TERRAIN_PATCH:
             close_patch()
             cur_patch = Patch(cur_def, patch_flags, lod_near, lod_far)
@@ -711,6 +751,29 @@ def _parse_commands(dsf: DSF, raw, s, e):
         if o > e:
             raise DSFError(f"command {cid} overran CMDS atom")
     close_patch()
+
+    # ------------------------------------------------------------- polygons
+    # The definition table holds (class, params) pairs, one per polygon def.
+    defs = dsf.defn.get(A_POLY) or []
+    for def_i, param, rings in raw_polys:
+        # the POLY definition table holds one entry (a .pol/.for/.lin path, or a
+        # legacy class name) per definition index
+        klass = defs[def_i] if def_i < len(defs) else ""
+        poly = Polygon(definition=def_i, klass=klass, param=param)
+        for ring in rings:
+            pts = []
+            for pool_i, vert_i in ring:
+                try:
+                    v = dsf.pools[pool_i][vert_i]
+                except IndexError:
+                    continue
+                pts.append((float(v[0]), float(v[1])))
+            if len(pts) > 3 and pts[0] == pts[-1]:
+                pts.pop()                     # DSF repeats the first point
+            if len(pts) >= 3:
+                poly.rings.append(pts)
+        if poly.rings:
+            dsf.polygons.append(poly)
 
 
 def summary(dsf: DSF):

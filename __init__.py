@@ -994,6 +994,82 @@ def _apply_dsf_texture(mat, resolver, entry, max_px=0, affine=None, zproj=True):
     return base_img is not None
 
 
+def _build_polygon_outlines(terrain, dsf, georef, include_forests, lift=0.05):
+    """Edge-only mesh with the DSF's polygon boundaries, draped on the terrain.
+
+    Nothing is filled and nothing is textured: a .pol / .fac / legacy class polygon
+    becomes a closed outline, a .lin (line feature) an open polyline. Forest areas
+    (.for) are left out unless asked for -- a Global Scenery tile holds thousands of
+    them and their outlines drown the pavement the user is looking for.
+    """
+    from mathutils import Vector
+    from mathutils.bvhtree import BVHTree
+
+    polys = [p for p in dsf.polygons
+             if include_forests or not p.klass.lower().endswith(".for")]
+    if not polys:
+        return None, {"polygons": 0, "rings": 0, "points": 0, "shown": [], "dropped": 0}
+
+    bvh = None
+    if terrain is not None:
+        sample = [v.co.z for v in terrain.data.vertices[:4000]]
+        z_fallback = min(sample) if sample else 0.0
+        z_top = max(sample) + 1000.0 if sample else 10000.0
+        try:
+            bvh = BVHTree.FromObject(terrain, bpy.context.evaluated_depsgraph_get())
+        except Exception:                                      # noqa: BLE001
+            bvh = None
+    else:
+        z_fallback = 0.0
+
+    verts, edges = [], []
+    counts, dropped = {}, 0
+    for poly in polys:
+        open_line = poly.klass.lower().endswith(".lin")
+        for ring in poly.rings:
+            base = len(verts)
+            hits = 0
+            for lon, lat in ring:
+                xy = _geo_to_blender(georef, lon, lat, 0.0)[0]
+                x, y = float(xy[0]), float(xy[1])
+                z = None
+                if bvh is not None:
+                    loc, _nor, _idx, _dist = bvh.ray_cast(
+                        Vector((x, y, z_top)), Vector((0.0, 0.0, -1.0)), 40000.0)
+                    if loc is not None:
+                        z = loc.z
+                        hits += 1
+                verts.append((x, y, (z if z is not None else z_fallback) + lift))
+            if not hits:
+                dropped += 1
+            n = len(ring)
+            edges.extend((base + i, base + i + 1) for i in range(n - 1))
+            if not open_line and n > 2:
+                edges.append((base + n - 1, base))
+        name = poly.klass.split("/")[-1] or "polygon"
+        counts[name] = counts.get(name, 0) + 1
+
+    if not verts:
+        return None, {"polygons": 0, "rings": 0, "points": 0, "shown": [],
+                      "dropped": dropped}
+    base_name = os.path.splitext(os.path.basename(dsf.source_path or "dsf"))[0]
+    me = bpy.data.meshes.new(base_name + "_polygons")
+    me.from_pydata(verts, edges, [])
+    me.update()
+    ob = bpy.data.objects.new(base_name + "_polygons", me)
+    ob["dsf_polygons"] = json.dumps(counts, sort_keys=True)
+    ob["dsf_georef"] = json.dumps(georef)
+    context_collection = (terrain.users_collection[0] if terrain.users_collection
+                          else bpy.context.scene.collection) if terrain is not None \
+        else bpy.context.scene.collection
+    context_collection.objects.link(ob)
+    stats = {"polygons": len(polys), "rings": sum(len(p.rings) for p in polys),
+             "points": len(verts), "shown": sorted(counts.items(),
+                                                   key=lambda kv: -kv[1])[:6],
+             "dropped": dropped}
+    return ob, stats
+
+
 def _import_dsf_terrain(op, context):
     """Build the tile's terrain mesh from a DSF (the .dsf import operator's work)."""
     dsf = DC.load_dsf(op.filepath)
@@ -1351,6 +1427,11 @@ def _build_pavement_mesh(name, pavs, elev_by_id, georef, terrain_obj, step, lift
     return obj, stats
 
 
+def _tile_id_for(lat, lon):
+    """X-Plane / Ortho4XP tile name a lat/lon falls in, e.g. +61-149."""
+    return "%+03d%+04d" % (math.floor(lat), math.floor(lon))
+
+
 def _pavement_bounds(pavs):
     """lon/lat box of the given pavements (used when there is no terrain tile)."""
     lons, lats = [], []
@@ -1550,6 +1631,21 @@ class IMPORT_OT_xplane_dsf(bpy.types.Operator, ImportHelper):
     smooth: BoolProperty(name="Smooth shading", default=True,
                          description="Shade the terrain smooth (it looks faceted "
                                      "otherwise)")
+    polygons: BoolProperty(
+        name="Polygon outlines",
+        description="Also import the DSF's polygons as plain boundaries (edges, no "
+                    "faces, no texture): .pol and .fac polygons and legacy class "
+                    "names become closed outlines, .lin line features open polylines, "
+                    "all draped on the terrain. Separate object, <tile>_polygons",
+        default=True,
+    )
+    forests: BoolProperty(
+        name="Include forest areas (.for)",
+        description="Also draw forest boundaries. A Global Scenery tile holds "
+                    "thousands of forest polygons (~9,000 on +45-111), so it is off "
+                    "by default",
+        default=False,
+    )
     mark_seams: BoolProperty(
         name="Seams from UV islands", default=False,
         description="Mark the borders between terrain-type UV islands as seams. Off "
@@ -1563,10 +1659,54 @@ class IMPORT_OT_xplane_dsf(bpy.types.Operator, ImportHelper):
                     "imports the terrain mesh)",
     )
 
+    def _import_overlay(self, context):
+        """A DSF with polygons but no terrain: import the outlines on their own.
+
+        Overlay sceneries (a scenery package's own .dsf, the Global Airports layer)
+        carry no terrain patches. Their polygons still describe real places, so they
+        are draped on any tile already in the scene and placed at the tile origin
+        otherwise instead of the import dying with 'no terrain mesh'.
+        """
+        dsf = DC.load_dsf(self.filepath)
+        west, east, south, north = _dsf_bounds(dsf)
+        georef = _georef_from_bounds(west, east, south, north)
+        tile = _terrain_tile_for_pavements(context)
+        terrain = None
+        if tile is not None:
+            tw, te, ts, tn = tile[2]
+            if (west >= tw - 0.01 and east <= te + 0.01
+                    and south >= ts - 0.01 and north <= tn + 0.01):
+                terrain = tile[0]
+            else:
+                print("[X-Plane DSF import] %s does not cover this DSF (tile %s, not %s)"
+                      % (tile[0].name, _tile_id_for((south + north) * 0.5,
+                                                    (west + east) * 0.5), tile[0].name))
+        poly_obj, pstats = _build_polygon_outlines(terrain, dsf, georef, self.forests)
+        if poly_obj is None:
+            self.report({"WARNING"},
+                        "DSF: no terrain and no polygon to import in %s"
+                        % os.path.basename(self.filepath))
+            return {"CANCELLED"}
+        msg = ("overlay DSF (no terrain): %d polygon(s), %d ring(s), %d point(s) in %s "
+               "— %s" % (pstats["polygons"], pstats["rings"], pstats["points"],
+                         poly_obj.name,
+                         "draped on %s" % terrain.name if terrain is not None
+                         else "no tile in the scene, placed from lat/lon 0 m up"))
+        print("[X-Plane DSF import] " + msg)
+        self.report({"INFO"}, msg)
+        if pstats["shown"]:
+            print("[X-Plane DSF import] polygon classes: "
+                  + ", ".join("%s x%d" % kv for kv in pstats["shown"]))
+        context.view_layer.objects.active = poly_obj
+        poly_obj.select_set(True)
+        return {"FINISHED"}
+
     def execute(self, context):
         try:
             obj, me, dsf, georef, stats = _import_dsf_terrain(self, context)
         except DC.DSFError as ex:
+            if self.polygons and "no terrain mesh" in str(ex):
+                return self._import_overlay(context)
             self.report({"ERROR"}, "DSF: %s" % ex)
             return {"CANCELLED"}
         except Exception as ex:                                # noqa: BLE001
@@ -1579,6 +1719,27 @@ class IMPORT_OT_xplane_dsf(bpy.types.Operator, ImportHelper):
             o.select_set(False)
         obj.select_set(True)
         context.view_layer.objects.active = obj
+
+        if self.polygons:
+            poly_obj, pstats = _build_polygon_outlines(obj, dsf, georef, self.forests)
+            if poly_obj is not None:
+                msg = ("Polygon outlines: %d polygon(s), %d ring(s), %d point(s) in %s%s"
+                       % (pstats["polygons"], pstats["rings"], pstats["points"],
+                          poly_obj.name,
+                          (", " + ", ".join("%s x%d" % (k, v)
+                                            for k, v in pstats["shown"]))
+                          if pstats["shown"] else ""))
+                print("[X-Plane DSF import] " + msg)
+                self.report({"INFO"}, msg)
+                if pstats["dropped"]:
+                    msg = ("%d ring(s) fell outside the terrain and were left at the "
+                           "tile's base height" % pstats["dropped"])
+                    print("[X-Plane DSF import] " + msg)
+                    self.report({"WARNING"}, msg)
+            else:
+                print("[X-Plane DSF import] no polygon to import%s"
+                      % ("" if self.forests else
+                         " (forest areas are skipped; tick Include forest areas)"))
 
         info = ("DSF %s%s: %d triangles, %d patches, %d terrain defs, lon %.6f..%.6f "
                 "lat %.6f..%.6f" % (obj.name, " [7z]" if stats["compressed"] else "",

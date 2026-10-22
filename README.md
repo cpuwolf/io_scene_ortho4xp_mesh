@@ -68,6 +68,14 @@ the installed list and tick it.
 
 * `File → Import → Ortho4XP Mesh (.mesh)`
 * `File → Import → X-Plane DSF (terrain, .dsf)`
+* `File → Import → X-Plane DSF (.dsf)` also brings the DSF's **polygon boundaries**
+  along: `.pol` / `.fac` polygons and legacy class names become closed outlines,
+  `.lin` line features open polylines, draped on the terrain and stored in a separate
+  `<tile>_polygons` object — edges only, no faces and no texture. Forest areas
+  (`.for`) are off by default (a Global Scenery tile has ~9,000 of them); tick
+  *Include forest areas*. An overlay DSF (one with polygons but no terrain, like a
+  scenery package's own `.dsf`) imports its outlines too, draped on whichever tile in
+  the scene covers it.
 * `File → Import → X-Plane apt.dat (pavement, .dat)` — the airport's taxiway/apron
   boundaries from apt.dat 12.00. Independent of the DSF importer: give airport
   identifiers (or import a whole apt.dat) and the pavement is placed at each airport's
