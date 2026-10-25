@@ -5,11 +5,15 @@ Only what the importer needs, and only for the airports inside a tile:
     row 1/16/17   airport header      -> elevation (ft), identifier, name
     row 1302      datum_lat/datum_lon -> the position used to decide "in this tile"
     row 110       pavement header     -> surface type, smoothness, texture orientation
-    row 111/113   pavement node       -> one boundary vertex
+    row 111       node                -> one boundary vertex
     row 112       node + control pt   -> the edge leaving that node is a quadratic Bezier
+    row 113       node, closes        -> closes this loop
+    row 114       node + control pt, closes
+    row 115/116   node ending a string (line features only)
 
-`112` repeats the coordinates of the node it belongs to and adds one control point, so
-the edge from that node to the next one curves through it.
+Every node row carries its own coordinates; `112`/`114`/`116` add the control point of
+the edge that leaves that node. `113`/`114` end a loop, and a pavement may hold more than
+one loop: the first is its outline, the rest are holes cut out of it.
 
 The file is 300+ MB in a full install, so `read_pavements` streams it once, keeps only
 the airports whose datum falls inside the requested bounds, and never builds a global
@@ -51,10 +55,10 @@ def surface_color(code):
 
 
 class Pavement:
-    """One row-110 chunk: a closed boundary with optional Bezier control points."""
+    """One row-110 chunk: an outline plus holes, with optional Bezier control points."""
 
     __slots__ = ("airport", "airport_name", "surface", "smoothness", "orientation",
-                 "name", "ring", "ctrl")
+                 "name", "rings", "ctrls", "closed")
 
     def __init__(self, airport, airport_name, surface, smoothness, orientation, name):
         self.airport = airport
@@ -63,43 +67,121 @@ class Pavement:
         self.smoothness = smoothness
         self.orientation = orientation
         self.name = name
-        self.ring = []          # [(lat, lon), ...]   first point is not repeated
-        self.ctrl = []          # per vertex: (lat, lon) control point or None
+        self.rings = []         # [[(lat, lon), ...], ...]  first = outline, rest = holes
+        self.ctrls = []         # per ring: per vertex (lat, lon) control point or None
+        self.closed = []        # per ring: did a 113/114 (or a 115/116 string end) end it
+
+    def add_node(self, lat, lon, ctrl=None):
+        # Writers repeat a node and give it its control point on the 112/114/116 row.
+        # Appending would leave a zero-length edge and hang the curve on the wrong
+        # segment, so the control point goes back onto the node it repeats.
+        if self.rings and not self.closed[-1] and self.rings[-1]:
+            last = self.rings[-1][-1]
+            if ctrl is not None and last == (lat, lon) \
+                    and self.ctrls[-1][-1] is None:
+                self.ctrls[-1][-1] = ctrl
+                return
+        if not self.rings or self.closed[-1]:
+            self.rings.append([])
+            self.ctrls.append([])
+            self.closed.append(False)
+        self.rings[-1].append((lat, lon))
+        self.ctrls[-1].append(ctrl)
+
+    def end_ring(self):
+        if self.rings:
+            self.closed[-1] = True
+
+    @property
+    def ring(self):
+        """The outline, for callers that only care about the outer boundary."""
+        return self.rings[0] if self.rings else []
+
+    def rings_m(self, georef, step_m=20.0):
+        """Every loop densified to ~step_m, in the tile's local metres (outline first)."""
+        out = []
+        for ring, ctrls in zip(self.rings, self.ctrls):
+            pts = _densify(georef, ring, ctrls, step_m)
+            if len(pts) >= 3:
+                out.append(pts)
+        return out
 
     def boundary_m(self, georef, step_m=20.0):
-        """Closed boundary densified to ~step_m, in the tile's local metres.
+        """The outline only, densified; holes are not cut out (see `outline_m`)."""
+        rings = self.rings_m(georef, step_m)
+        return rings[0] if rings else []
 
-        Straight edges are subdivided; an edge whose start vertex carries a control
-        point is a quadratic Bezier, so the boundary follows the curve the airport
-        designer drew rather than a chord.
-        """
-        out = []
-        n = len(self.ring)
-        for i in range(n):
-            lat0, lon0 = self.ring[i]
-            lat1, lon1 = self.ring[(i + 1) % n]
-            p0 = _to_m(georef, lat0, lon0)
-            p1 = _to_m(georef, lat1, lon1)
-            ctrl = self.ctrl[i]
-            if ctrl is not None:
-                c = _to_m(georef, ctrl[0], ctrl[1])
-                # curve length: chord + 2x handle-to-chord distance, good enough to
-                # pick a subdivision count
-                approx = (math.dist(p0, c) + math.dist(c, p1) + math.dist(p0, p1)) * 0.5
-                steps = max(2, min(64, int(math.ceil(approx / step_m))))
-                for s in range(steps):
-                    t = s / steps
-                    mt = 1.0 - t
-                    x = mt * mt * p0[0] + 2 * mt * t * c[0] + t * t * p1[0]
-                    y = mt * mt * p0[1] + 2 * mt * t * c[1] + t * t * p1[1]
-                    out.append((x, y))
-            else:
-                steps = max(1, min(256, int(math.ceil(math.dist(p0, p1) / step_m))))
-                for s in range(steps):
-                    t = s / steps
-                    out.append((p0[0] + (p1[0] - p0[0]) * t,
-                                p0[1] + (p1[1] - p0[1]) * t))
+    def outline_m(self, georef, step_m=20.0):
+        """One triangulatable ring: the outline with its holes bridged into it."""
+        rings = self.rings_m(georef, step_m)
+        if not rings:
+            return []
+        return _bridge_holes(rings[0], rings[1:])
+
+
+def _densify(georef, ring, ctrls, step_m):
+    """Sample a closed loop: straight edges subdivided, Bezier edges followed."""
+    out = []
+    n = len(ring)
+    if n < 3:
         return out
+    for i in range(n):
+        lat0, lon0 = ring[i]
+        lat1, lon1 = ring[(i + 1) % n]
+        p0 = _to_m(georef, lat0, lon0)
+        p1 = _to_m(georef, lat1, lon1)
+        ctrl = ctrls[i] if i < len(ctrls) else None
+        if ctrl is not None:
+            c = _to_m(georef, ctrl[0], ctrl[1])
+            approx = (math.dist(p0, c) + math.dist(c, p1) + math.dist(p0, p1)) * 0.5
+            steps = max(2, min(64, int(math.ceil(approx / step_m))))
+            for s in range(steps):
+                t = s / steps
+                mt = 1.0 - t
+                out.append((mt * mt * p0[0] + 2 * mt * t * c[0] + t * t * p1[0],
+                            mt * mt * p0[1] + 2 * mt * t * c[1] + t * t * p1[1]))
+        else:
+            steps = max(1, min(256, int(math.ceil(math.dist(p0, p1) / step_m))))
+            for s in range(steps):
+                t = s / steps
+                out.append((p0[0] + (p1[0] - p0[0]) * t,
+                            p0[1] + (p1[1] - p0[1]) * t))
+    return out
+
+
+def _area(ring):
+    tot = 0.0
+    for i in range(len(ring)):
+        x0, y0 = ring[i]
+        x1, y1 = ring[(i + 1) % len(ring)]
+        tot += x0 * y1 - x1 * y0
+    return tot * 0.5
+
+
+def _bridge_holes(outer, holes):
+    """Cut `holes` out of `outer` by bridging each one to the outline.
+
+    Each hole is joined to the nearest pair of vertices with a zero-width slit (the
+    standard way to make a polygon-with-holes ear-clippable), largest hole first so the
+    shorter bridges stay inside the area already cut.
+    """
+    if not holes:
+        return list(outer)
+    ring = list(outer)
+    for hole in sorted(holes, key=lambda h: -abs(_area(h))):
+        best = None
+        for i, a in enumerate(ring):
+            ax, ay = a
+            for j, b in enumerate(hole):
+                d = (ax - b[0]) ** 2 + (ay - b[1]) ** 2
+                if best is None or d < best[0]:
+                    best = (d, i, j)
+        if best is None:
+            continue
+        _, i, j = best
+        h = hole[j:] + hole[:j]                 # start the hole at its nearest vertex
+        ring = ring[:i + 1] + h + [h[0], ring[i]] + ring[i + 1:]
+    return ring
 
 
 def _to_m(georef, lat, lon):
@@ -131,8 +213,24 @@ def read_pavements(path, bounds, margin=0.02, ids=None):
 
     def close_pavement():
         nonlocal cur_pav
-        if cur_pav is not None and len(cur_pav.ring) >= 3 and cur_apt is not None:
-            cur_apt["pav"].append(cur_pav)
+        if cur_pav is not None and cur_apt is not None:
+            # keep every loop with three distinct points; a writer may repeat the first
+            # point of a loop, and holes are loops too
+            keep_rings, keep_ctrls, keep_closed = [], [], []
+            for ring, ctrls, closed in zip(cur_pav.rings, cur_pav.ctrls, cur_pav.closed):
+                pts = list(ring)
+                cts = list(ctrls)
+                while len(pts) > 1 and pts[0] == pts[-1]:
+                    pts.pop()
+                    cts.pop()
+                if len(pts) >= 3:
+                    keep_rings.append(pts)
+                    keep_ctrls.append(cts)
+                    keep_closed.append(closed)
+            if keep_rings:
+                cur_pav.rings, cur_pav.ctrls, cur_pav.closed = \
+                    keep_rings, keep_ctrls, keep_closed
+                cur_apt["pav"].append(cur_pav)
         cur_pav = None
 
     def close_airport():
@@ -146,11 +244,15 @@ def read_pavements(path, bounds, margin=0.02, ids=None):
             # airport at the mean of its own geometry
             lat = sum(pt[0] for pt in cur_apt["pts"]) / len(cur_apt["pts"])
             lon = sum(pt[1] for pt in cur_apt["pts"]) / len(cur_apt["pts"])
-        keep = bool(ids) and cur_apt["id"].upper() in ids
-        if lat is not None and lon is not None and (
+        if ids:
+            # identifiers win over the bounds: naming an airport must not depend on
+            # which tile happens to be open, and a world-sized bounds must not drag
+            # the other 37,000 airports of the file in with it
+            keep = cur_apt["id"].upper() in ids
+        else:
+            keep = lat is not None and lon is not None and (
                 west - margin <= lon <= east + margin
-                and south - margin <= lat <= north + margin):
-            keep = True
+                and south - margin <= lat <= north + margin)
         if keep:
             airports.append((cur_apt["id"], cur_apt["name"], cur_apt["elev"],
                              lat, lon))
@@ -201,91 +303,158 @@ def read_pavements(path, bounds, margin=0.02, ids=None):
                 continue
             if cur_pav is None:
                 continue
-            if code in ("111", "113") and len(f) >= 3:
+            if code in ("111", "112", "113", "114", "115", "116") and len(f) >= 3:
                 lat, lon = _f(f[1]), _f(f[2])
-                cur_pav.ring.append((lat, lon))
-                cur_pav.ctrl.append(None)
+                ctrl = None
+                if code in ("112", "114", "116") and len(f) >= 5:
+                    ctrl = (_f(f[3]), _f(f[4]))
+                cur_pav.add_node(lat, lon, ctrl)
                 if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
                     cur_apt["pts"].append((lat, lon))
-                if code == "113":
-                    close_pavement()
-                continue
-            if code == "112" and len(f) >= 5:
-                lat, lon = _f(f[1]), _f(f[2])
-                pt = (_f(f[3]), _f(f[4]))
-                # `112` repeats the node it belongs to and adds its control point;
-                # a node we have not seen yet is inserted first
-                if cur_pav.ring and abs(cur_pav.ring[-1][0] - lat) < 1e-7 \
-                        and abs(cur_pav.ring[-1][1] - lon) < 1e-7:
-                    cur_pav.ctrl[-1] = pt
-                else:
-                    cur_pav.ring.append((lat, lon))
-                    cur_pav.ctrl.append(pt)
+                if code in ("113", "114", "115", "116"):
+                    # 113/114 close this loop; 115/116 end a string. Either way the
+                    # next node row starts a new loop -- a hole, or a new feature
+                    cur_pav.end_ring()
                 continue
     close_airport()
     return out, airports
 
 
+def _point_in_ring(pt, ring):
+    """Even-odd containment test for a ring given in metres."""
+    x, y = pt
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if (yi > y) != (yj > y):
+            xcross = xi + (y - yi) * (xj - xi) / (yj - yi)
+            if x < xcross:
+                inside = not inside
+        j = i
+    return inside
+
+
+def triangulate(rings, filter_triangles=True):
+    """Triangulate one pavement: rings[0] is the outline, the rest are holes.
+
+    The holes are bridged into the outline and the result is ear-clipped; with
+    `filter_triangles` every triangle whose centroid is not inside the outline, or is
+    inside a hole, is dropped. That keeps a bridged slit from painting pavement across
+    the hole the slit was cut for, which is what makes an apron look wrong even when
+    the boundary itself is right.
+    """
+    if not rings:
+        return [], []
+    outer, holes = rings[0], rings[1:]
+    bridged = _bridge_holes(outer, holes)
+    tris = ear_clip(bridged)
+    if not filter_triangles:
+        return bridged, tris
+    keep = []
+    for t in tris:
+        cx = (bridged[t[0]][0] + bridged[t[1]][0] + bridged[t[2]][0]) / 3.0
+        cy = (bridged[t[0]][1] + bridged[t[1]][1] + bridged[t[2]][1]) / 3.0
+        c = (cx, cy)
+        if not _point_in_ring(c, outer):
+            continue
+        if any(_point_in_ring(c, h) for h in holes):
+            continue
+        keep.append(t)
+    return bridged, keep
+
+
 def ear_clip(points):
     """Triangulate a simple polygon given as [(x, y), ...] (local metres).
 
-    Returns index triples. O(n^2), which is nothing for an airport pavement
-    boundary (tens of vertices). Self-intersecting or duplicate-vertex rings fall
-    back to a fan over the remaining points instead of losing the pavement.
+    Returns index triples. Densified pavements are full of collinear runs and of
+    points that sit exactly on another ear's edge, so the containment test is strict
+    (a point on an edge does not block an ear) and a second pass accepts collinear
+    ears: without those two the clipper stalls on perfectly ordinary aprons and leaves
+    a fifth of the pavement untriangulated.
+
+    A ring the source file made self-intersecting still ends up with the triangles the
+    clipper managed to produce rather than a fan spanning the whole chunk.
     """
     n = len(points)
     if n < 3:
         return []
+    pts, idxmap = [], []                  # cleaned ring + where each point came from
+    for k, p in enumerate(points):        # drop repeated neighbours: zero-length edges
+        if not pts or abs(p[0] - pts[-1][0]) > 1e-6 or abs(p[1] - pts[-1][1]) > 1e-6:
+            pts.append(p)
+            idxmap.append(k)
+    while len(pts) > 3 and abs(pts[0][0] - pts[-1][0]) < 1e-6 \
+            and abs(pts[0][1] - pts[-1][1]) < 1e-6:
+        pts.pop()
+        idxmap.pop()
+    n = len(pts)
+    if n < 3:
+        return []
+
     area = 0.0
     for i in range(n):
-        x0, y0 = points[i]
-        x1, y1 = points[(i + 1) % n]
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % n]
         area += x0 * y1 - x1 * y0
     order = list(range(n)) if area > 0 else list(range(n))[::-1]
 
     def cross(o, a, b):
-        return ((points[a][0] - points[o][0]) * (points[b][1] - points[o][1])
-                - (points[a][1] - points[o][1]) * (points[b][0] - points[o][0]))
+        return ((pts[a][0] - pts[o][0]) * (pts[b][1] - pts[o][1])
+                - (pts[a][1] - pts[o][1]) * (pts[b][0] - pts[o][0]))
 
-    def inside(p, a, b, c):
-        d1 = cross_p(p, points[a], points[b])
-        d2 = cross_p(p, points[b], points[c])
-        d3 = cross_p(p, points[c], points[a])
-        neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
-        pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
-        return not (neg and pos)
-
-    def cross_p(p, a, b):
-        return ((p[0] - a[0]) * (b[1] - a[1]) - (p[1] - a[1]) * (b[0] - a[0]))
+    def strictly_inside(p, a, b, c):
+        eps = 1e-9
+        d1 = ((p[0] - pts[a][0]) * (pts[b][1] - pts[a][1])
+              - (p[1] - pts[a][1]) * (pts[b][0] - pts[a][0]))
+        d2 = ((p[0] - pts[b][0]) * (pts[c][1] - pts[b][1])
+              - (p[1] - pts[b][1]) * (pts[c][0] - pts[b][0]))
+        d3 = ((p[0] - pts[c][0]) * (pts[a][1] - pts[c][1])
+              - (p[1] - pts[c][1]) * (pts[a][0] - pts[c][0]))
+        return (d1 > eps and d2 > eps and d3 > eps) or \
+               (d1 < -eps and d2 < -eps and d3 < -eps)
 
     tris = []
-    guard = 0
-    while len(order) > 3 and guard < n * n:
-        guard += 1
-        clipped = False
-        for k in range(len(order)):
-            i0 = order[(k - 1) % len(order)]
-            i1 = order[k]
-            i2 = order[(k + 1) % len(order)]
-            if cross(i0, i1, i2) <= 1e-9:
-                continue
-            ok = True
-            for j in order:
-                if j in (i0, i1, i2):
+    stalled = 0
+    for min_cross in (1e-9, -1e-9):        # strict first, then allow collinear ears
+        while len(order) > 3 and stalled <= n:
+            clipped = False
+            best = None
+            best_cross = 0.0
+            for k in range(len(order)):
+                i0 = order[(k - 1) % len(order)]
+                i1 = order[k]
+                i2 = order[(k + 1) % len(order)]
+                c = cross(i0, i1, i2)
+                if abs(c) < abs(best_cross) or best is None:
+                    best, best_cross = k, c
+                if c <= min_cross:
                     continue
-                if inside(points[j], i0, i1, i2):
-                    ok = False
+                ok = True
+                for j in order:
+                    if j in (i0, i1, i2):
+                        continue
+                    if strictly_inside(pts[j], i0, i1, i2):
+                        ok = False
+                        break
+                if ok:
+                    tris.append((idxmap[i0], idxmap[i1], idxmap[i2]))
+                    order.pop(k)
+                    clipped = True
                     break
-            if ok:
-                tris.append((i0, i1, i2))
-                order.pop(k)
-                clipped = True
-                break
-        if not clipped:
+            if clipped:
+                continue
+            # No ear anywhere: the ring pinches itself at a repeated vertex or doubles
+            # back on an edge. Collapsing the flattest vertex loses no measurable area
+            # and lets the clipper finish, which beats fanning the remnant across the
+            # chunk (that is how a 12,000 m2 apron became 14,700 m2 of pavement).
+            if best is not None:
+                order.pop(best)
+            stalled += 1
+        if len(order) <= 3:
             break
     if len(order) == 3:
-        tris.append((order[0], order[1], order[2]))
-    elif len(order) > 3:                     # degenerate ring: fan, keep the shape
-        for k in range(1, len(order) - 1):
-            tris.append((order[0], order[k], order[k + 1]))
+        tris.append(tuple(idxmap[i] for i in order))
     return tris

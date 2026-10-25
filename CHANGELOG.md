@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.7.2
+## 1.7.3
 
 **New since 1.3.0** — the add-on now brings in an X-Plane tile's whole airport layer, not
 just the editable mesh.
@@ -15,6 +15,9 @@ just the editable mesh.
 - **Boundaries you can edit elsewhere.** The DSF's polygons — aprons, fences, painted
   lines, vegetation areas — arrive as a separate outlines object, and are saved next to the
   DSF as an `.osm` file, so you can open, compare against imagery and edit them in JOSM.
+- **Aprons keep their holes.** Grass islands, buildings and closed stands cut out of a
+  taxiway or apron stay cut out: the pavement no longer covers them, and naming one airport
+  no longer drags the whole worldwide file in with it.
 - **Smaller things.** Polygons-only scenery files (the airport overlay layers) now open
   instead of being refused, and picking which airports to bring in from the worldwide
   `apt.dat` is a one-field job.

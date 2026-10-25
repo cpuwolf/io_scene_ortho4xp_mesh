@@ -1325,7 +1325,9 @@ def _subdivide(tri, max_edge, depth=0):
     # produced tens of thousands of triangles for one grass strip.  The edge guard
     # keeps a leftover sliver from spanning a hillside.
     area = abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) * 0.5
-    if depth >= 6 or (area <= max_edge * max_edge and longest <= 5.0 * max_edge):
+    # stop early: an apron interior needs no 20 m grid, the densified boundary already
+    # gives the edges that follow the shape, and the ray-cast drapes whatever is left
+    if depth >= 4 or (area <= 16.0 * max_edge * max_edge and longest <= 8.0 * max_edge):
         return [tri]
     ab = ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
     bc = ((b[0] + c[0]) * 0.5, (b[1] + c[1]) * 0.5)
@@ -1366,7 +1368,7 @@ def _build_pavement_mesh(name, pavs, elev_by_id, georef, terrain_obj, step, lift
     is placed at the airport's own elevation from apt.dat row 1, i.e. flat, which is
     what the file itself says.
     """
-    stats = {"pavements": 0, "triangles": 0, "verts": 0, "unplaced": 0,
+    stats = {"pavements": 0, "triangles": 0, "verts": 0, "unplaced": 0, "holes": 0,
              "draped": terrain_obj is not None, "terrain": None}
     bvh = None
     if terrain_obj is not None:
@@ -1389,7 +1391,7 @@ def _build_pavement_mesh(name, pavs, elev_by_id, georef, terrain_obj, step, lift
     slot_of = {}
     all_verts, all_faces, face_slot = [], [], []
     for pav in pavs:
-        boundary = pav.boundary_m(georef, step)
+        boundary = pav.outline_m(georef, step)      # outline with its holes bridged
         if len(boundary) < 3:
             continue
         tris = AC.ear_clip(boundary)
@@ -1588,6 +1590,9 @@ class IMPORT_OT_xplane_apt(bpy.types.Operator, ImportHelper):
                                      "placed (%d unplaced)" % stats["unplaced"])
             return {"CANCELLED"}
         obj["apt_dat"] = self.filepath
+        # the frame the pavement was placed in: without it nothing can re-drape or
+        # convert the mesh back to lat/lon afterwards
+        obj["apt_georef"] = json.dumps(georef)
         obj["apt_airports"] = json.dumps(sorted({p.airport for p in pavs}))
         msg = ("Pavement: %d chunk(s) from %d airport(s) — %d triangles, %s"
                % (stats["pavements"], len({p.airport for p in pavs}),

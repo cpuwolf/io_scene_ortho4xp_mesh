@@ -6,23 +6,46 @@ other, and neither needs the DSF terrain import to work.
 
 ## apt.dat pavement — `File → Import → X-Plane apt.dat (pavement, .dat)`
 
-Reads apt.dat 12.00 (`110` pavement chunks, `111` / `112` / `113` nodes, quadratic Bezier
-edges sampled), triangulates the rings and drapes them on the tile that is already in the
-scene. 8.50/10.50-era files without `110` rows simply contribute nothing.
+Reads apt.dat 12.00, triangulates the boundaries and drapes them on the tile that is
+already in the scene. 8.50/10.50-era files without `110` rows contribute nothing.
+
+The row model, all six node types:
+
+| row | meaning |
+|---|---|
+| `110` | pavement header: surface type, smoothness, texture orientation, name |
+| `111` | node |
+| `112` | node + the control point of the edge leaving it (quadratic Bezier) |
+| `113` | node, closes this loop |
+| `114` | node + control point, closes this loop |
+| `115` / `116` | node ending a string (line features); `116` also has a control point |
+
+A pavement is **one or more loops**: the first is its outline, the rest are holes cut out
+of it (grass islands, buildings, parked stands). Global Airports has 9,821 chunks with
+holes and 35,938 holes in total, so a reader that closes the chunk on the first `113` and
+ignores what follows paints pavement over every one of them.
 
 | option | meaning |
 |---|---|
 | `Airports` | comma-separated identifiers (`KLVM, 29S`). Empty = the airports inside the scene's tile, or every airport in the file when there is no tile |
 | `Use the scene's tile` | when a tile is in the scene, take the airports inside it and drape on its terrain |
 | `Airport limit` | safety valve: without identifiers and without a tile, refuse a file holding more airports than this (the worldwide apt.dat has ~38,000) |
-| `Grid (m)` | boundary densification step; also the size the ear-clipped triangles are subdivided towards |
+| `Grid (m)` | boundary densification step; triangles are only split while they are still much larger than this (16x its square), so an apron interior is not turned into a 20 m grid |
 | `Lift (m)` | how far above the terrain the pavement sits (default 0.12 m) |
+
+Loops are bridged into the outline and ear-clipped; a triangle whose centre falls inside
+a hole, or outside the outline, is dropped, so the hole stays empty even when the bridge
+slit leaves the clipper guessing. Checked by sampling 4,000 points per chunk: 0.00 %
+of the inside points uncovered and 0.00 % of the outside points covered, on tiles with up
+to 15 loops.
 
 Where the pavement ends up:
 
 - **A tile in the scene covers these airports** (a DSF import or an Ortho4XP `.mesh` import
   — both store the georeference the importer needs) → each vertex is ray-cast onto that
   mesh and lifted, so the pavement follows the curved surface.
+- **Identifiers given** → those airports, whatever tile is open and whatever the file's
+  other 37,000 airports are.
 - **No tile, or a tile that does not cover them** → flat at each airport's own apt.dat
   elevation. The console names the tile the pavement actually belongs to, e.g.
   `the pavement is at 61.3837, -148.3670 (tile +61-149) — but the scene holds …`.
