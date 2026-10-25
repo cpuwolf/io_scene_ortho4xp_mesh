@@ -1,15 +1,21 @@
 # X-Plane DSF & Ortho4XP Mesh (Blender extension)
 
-Two X-Plane tile importers in one extension, for Blender 4.2+ (tested on Blender 5.2.2 LTS,
-macOS):
+X-Plane scenery data in Blender: one extension, for Blender 4.2+ (tested on Blender 5.2.2
+LTS, macOS):
 
 * **Ortho4XP `.mesh`** — read *and write* the intermediate tile mesh, e.g.
   `Data+27+089.mesh`, with the tile's `.ter` orthophotos attached on import. This is the file
   to edit when water cuts, coastlines or airport levelling need fixing before the tile is
   rebuilt into a DSF.
-* **X-Plane `.dsf`** — import the terrain mesh of a *shipped* scenery tile (including the
-  7z-compressed Global Scenery files) with its terrain-type materials and textures. Import
-  only: a DSF carries layers this add-on does not model, so it is never written back.
+* **X-Plane `.dsf` terrain** — import the terrain mesh of a *shipped* scenery tile (including
+  the 7z-compressed Global Scenery files) with its terrain-type materials and textures, and
+  fill the placeholder heights Global Scenery leaves behind from the DSF's own raster DEM.
+  Import only: a DSF carries layers this add-on does not model, so it is never written back.
+* **DSF polygons** — the `.pol` / `.fac` / `.lin` boundaries over that terrain, as an
+  edge-only `<tile>_polygons` object, plus a `<dsf>.patch.osm` written next to the DSF so
+  JOSM can edit the same boundaries.
+* **apt.dat pavement** — the taxiway / apron boundaries of apt.dat 12.00, draped on whichever
+  tile is in the scene or placed flat at each airport's own elevation.
 
 <img src="doc/previews/preview_tile.png" width="760" alt="The +27+089 tile (Paro, Bhutan) imported with its orthophotos and rendered in Blender">
 
@@ -28,14 +34,14 @@ macOS):
 
 ## Install
 
-This repository *is* the package: `blender_manifest.toml` plus four Python modules. There is
+This repository *is* the package: `blender_manifest.toml` plus eight Python modules. There is
 nothing to build and no Python packages to install outside Blender (`numpy` ships with
-Blender; the `.mesh` codec itself is numpy-only).
+Blender; the `.mesh` and `.dsf` codecs are numpy-only, and the 7z decoder is plain stdlib).
 
 It is packaged as a **Blender extension**, so it needs **Blender 4.2 or newer**.
 
 **From the extensions platform** — *Edit → Preferences → Get Extensions*, search for
-**Ortho4XP Mesh**, then *Install*.  (Listing: <https://extensions.blender.org/>)
+**X-Plane DSF & Ortho4XP Mesh**, then *Install*.  (Listing: <https://extensions.blender.org/>)
 
 **From a zip** — take `io_scene_ortho4xp_mesh-<version>.zip` from the
 [releases](../../releases) page and use *Get Extensions → ⌄ → Install from Disk*. The archive
@@ -57,7 +63,7 @@ ln -s /path/to/io_scene_ortho4xp_mesh \
 | Windows | `%APPDATA%\Blender Foundation\Blender\<version>\extensions\user_default\` |
 | Linux | `~/.config/blender/<version>/extensions/user_default/` |
 
-**Enable it:** *Edit → Preferences → Get Extensions*, find **Ortho4XP Mesh Import/Export** in
+**Enable it:** *Edit → Preferences → Get Extensions*, find **X-Plane DSF & Ortho4XP Mesh** in
 the installed list and tick it.
 
 > **Not a legacy add-on any more.** The package carries no legacy metadata (it lives in
@@ -67,7 +73,9 @@ the installed list and tick it.
 **Where it appears:**
 
 * `File → Import → Ortho4XP Mesh (.mesh)`
-* `File → Import → X-Plane DSF (terrain, .dsf)`
+* `File → Import → X-Plane DSF (terrain, .dsf)` — terrain, textures and (optionally) the
+  polygons of one tile; a DSF with polygons but no terrain (a scenery package's own overlay,
+  the Global Airports layer) imports its outlines too.
 * `File → Import → X-Plane DSF (.dsf)` also brings the DSF's **polygon boundaries**
   along: `.pol` / `.fac` polygons and legacy class names become closed outlines,
   `.lin` line features open polylines, draped on the terrain and stored in a separate
@@ -136,6 +144,7 @@ more detail.
 | [doc/terrain-textures.md](doc/terrain-textures.md) | how the tile's `.ter` cells become materials + UVs, the lattice tiling, and the `tex_limit` / `tex_max_px` memory knobs |
 | [doc/import-and-export.md](doc/import-and-export.md) | every import and export option, the sidebar panel, what survives a round trip and what does not |
 | [doc/dsf-import.md](doc/dsf-import.md) | the DSF importer: 7z decoding, what is imported, the `.ter` mappings, known limits |
+| [doc/apt-and-polygons.md](doc/apt-and-polygons.md) | apt.dat pavement (rows, options, where it lands) and the DSF polygon outlines + `<dsf>.patch.osm` export |
 | [doc/verification.md](doc/verification.md) | the `verify/` scripts, measured results on real tiles, repository layout |
 | [doc/extensions-listing.md](doc/extensions-listing.md) | the text used for the extensions.blender.org listing, kept in sync with `blender_manifest.toml` |
 | [doc/workflow-en.html](doc/workflow-en.html) | workflow diagram (English) — standalone HTML, open in a browser |

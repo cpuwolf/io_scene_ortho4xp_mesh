@@ -6,7 +6,7 @@ schema_version = "1.0.0"
 # them into extensions/<repo>/io_scene_ortho4xp_mesh/).
 
 id = "io_scene_ortho4xp_mesh"
-version = "1.7.0"
+version = "1.7.1"
 name = "X-Plane DSF & Ortho4XP Mesh"
 tagline = "Import X-Plane DSF terrain and Ortho4XP meshes, with textures"
 maintainer = "Wei Shuai"
@@ -14,7 +14,7 @@ type = "add-on"
 
 # Valid add-on tags on extensions.blender.org:
 # https://docs.blender.org/manual/en/latest/advanced/extensions/tags.html
-tags = ["Import-Export", "UV", "Mesh"]
+tags = ["Import-Export"]
 
 website = "https://github.com/cpuwolf/io_scene_ortho4xp_mesh"
 # The platform only lists GPL-compliant add-ons; this is the required license.
