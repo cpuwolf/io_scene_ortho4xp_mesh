@@ -1,4 +1,4 @@
-# X-Plane DSF & Ortho4XP Mesh (Blender extension)
+# X-Plane DSF and Ortho4XP Mesh (Blender extension)
 
 X-Plane scenery data in Blender: one extension, for Blender 4.2+ (tested on Blender 5.2.2
 LTS, macOS):
@@ -41,7 +41,7 @@ Blender; the `.mesh` and `.dsf` codecs are numpy-only, and the 7z decoder is pla
 It is packaged as a **Blender extension**, so it needs **Blender 4.2 or newer**.
 
 **From the extensions platform** — *Edit → Preferences → Get Extensions*, search for
-**X-Plane DSF & Ortho4XP Mesh**, then *Install*.  (Listing: <https://extensions.blender.org/>)
+**X-Plane DSF and Ortho4XP Mesh**, then *Install*.  (Listing: <https://extensions.blender.org/>)
 
 **From a zip** — take `io_scene_ortho4xp_mesh-<version>.zip` from the
 [releases](../../releases) page and use *Get Extensions → ⌄ → Install from Disk*. The archive
@@ -63,7 +63,7 @@ ln -s /path/to/io_scene_ortho4xp_mesh \
 | Windows | `%APPDATA%\Blender Foundation\Blender\<version>\extensions\user_default\` |
 | Linux | `~/.config/blender/<version>/extensions/user_default/` |
 
-**Enable it:** *Edit → Preferences → Get Extensions*, find **X-Plane DSF & Ortho4XP Mesh** in
+**Enable it:** *Edit → Preferences → Get Extensions*, find **X-Plane DSF and Ortho4XP Mesh** in
 the installed list and tick it.
 
 > **Not a legacy add-on any more.** The package carries no legacy metadata (it lives in

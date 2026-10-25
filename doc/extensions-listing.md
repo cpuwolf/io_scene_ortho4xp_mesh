@@ -6,7 +6,7 @@ version changes.
 
 | field | value |
 |---|---|
-| Name | X-Plane DSF & Ortho4XP Mesh |
+| Name | X-Plane DSF and Ortho4XP Mesh |
 | Tagline (max 64 chars) | Import X-Plane DSF terrain and Ortho4XP meshes, with textures |
 | Type | Add-on |
 | Tags | Import-Export |
