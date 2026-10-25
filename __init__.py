@@ -152,6 +152,7 @@ from bpy_extras.io_utils import ExportHelper, ImportHelper
 from . import aptcodec as AC
 from . import dsfcodec as DC
 from . import meshcodec as MC
+from . import osmcodec as OSM
 from . import tercodec as TC
 from . import terrain_tiles as TT
 
@@ -994,6 +995,38 @@ def _apply_dsf_texture(mat, resolver, entry, max_px=0, affine=None, zproj=True):
     return base_img is not None
 
 
+def _write_polygon_osm(op, dsf, include_forests=False):
+    """Auto-save the DSF's polygon boundaries as <dsf>.patch.osm; returns the path."""
+    if not getattr(op, "osm_export", False):
+        return None
+    custom = (getattr(op, "osm_path", "") or "").strip()
+    if custom:
+        target = bpy.path.abspath(custom)
+        if os.path.isdir(target):
+            target = os.path.join(target, os.path.basename(
+                os.path.splitext(op.filepath)[0]) + ".patch.osm")
+    else:
+        target = os.path.splitext(op.filepath)[0] + ".patch.osm"
+    try:
+        ways, nodes, nbytes = OSM.write_osm(
+            target, dsf.polygons,
+            note="X-Plane polygon boundaries from %s, written by the Blender importer"
+                 % os.path.basename(op.filepath),
+            include_forests=include_forests)
+    except OSError as ex:
+        msg = "could not write %s: %s" % (target, ex)
+        print("[X-Plane DSF import] " + msg)
+        op.report({"WARNING"}, msg)
+        return None
+    if not ways:
+        return None
+    msg = ("polygon boundaries saved to %s (%d way(s), %d node(s), %.0f kB)"
+           % (target, ways, nodes, nbytes / 1024.0))
+    print("[X-Plane DSF import] " + msg)
+    op.report({"INFO"}, msg)
+    return target
+
+
 def _build_polygon_outlines(terrain, dsf, georef, include_forests, lift=0.05):
     """Edge-only mesh with the DSF's polygon boundaries, draped on the terrain.
 
@@ -1628,6 +1661,18 @@ class IMPORT_OT_xplane_dsf(bpy.types.Operator, ImportHelper):
                     "nailed to the map while vertices move — the same behaviour the "
                     ".mesh importer offers",
     )
+    osm_export: BoolProperty(
+        name="Write .osm",
+        description="Save the imported polygon boundaries as OSM XML next to the DSF "
+                    "(<dsf>.patch.osm), one way per winding with the X-Plane class in "
+                    "the xplane_class tag, so JOSM can open and edit them",
+        default=True,
+    )
+    osm_path: StringProperty(
+        name=".osm file", subtype="FILE_PATH", default="",
+        description="Where to write the .osm; leave empty for <dsf>.patch.osm next to "
+                    "the DSF",
+    )
     smooth: BoolProperty(name="Smooth shading", default=True,
                          description="Shade the terrain smooth (it looks faceted "
                                      "otherwise)")
@@ -1687,6 +1732,7 @@ class IMPORT_OT_xplane_dsf(bpy.types.Operator, ImportHelper):
                         "DSF: no terrain and no polygon to import in %s"
                         % os.path.basename(self.filepath))
             return {"CANCELLED"}
+        _write_polygon_osm(self, dsf, self.forests)
         msg = ("overlay DSF (no terrain): %d polygon(s), %d ring(s), %d point(s) in %s "
                "— %s" % (pstats["polygons"], pstats["rings"], pstats["points"],
                          poly_obj.name,
@@ -1723,6 +1769,7 @@ class IMPORT_OT_xplane_dsf(bpy.types.Operator, ImportHelper):
         if self.polygons:
             poly_obj, pstats = _build_polygon_outlines(obj, dsf, georef, self.forests)
             if poly_obj is not None:
+                _write_polygon_osm(self, dsf, self.forests)
                 msg = ("Polygon outlines: %d polygon(s), %d ring(s), %d point(s) in %s%s"
                        % (pstats["polygons"], pstats["rings"], pstats["points"],
                           poly_obj.name,

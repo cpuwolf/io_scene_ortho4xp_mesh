@@ -73,7 +73,10 @@ the installed list and tick it.
   `.lin` line features open polylines, draped on the terrain and stored in a separate
   `<tile>_polygons` object — edges only, no faces and no texture. Forest areas
   (`.for`) are off by default (a Global Scenery tile has ~9,000 of them); tick
-  *Include forest areas*. An overlay DSF (one with polygons but no terrain, like a
+  *Include forest areas*. The same boundaries are auto-saved next to the DSF as
+  `<dsf>.patch.osm` (OSM XML, one way per winding, the X-Plane class in the
+  `xplane_class` tag), so JOSM can open and edit them; *Write .osm* turns that off and
+  *`.osm file`* redirects it. An overlay DSF (one with polygons but no terrain, like a
   scenery package's own `.dsf`) imports its outlines too, draped on whichever tile in
   the scene covers it.
 * `File → Import → X-Plane apt.dat (pavement, .dat)` — the airport's taxiway/apron
