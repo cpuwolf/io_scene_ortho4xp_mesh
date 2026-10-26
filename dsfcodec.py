@@ -768,8 +768,16 @@ def _parse_commands(dsf: DSF, raw, s, e):
                 except IndexError:
                     continue
                 pts.append((float(v[0]), float(v[1])))
+            # WED repeats a vertex (a zero-length edge) in most of these polygons and
+            # repeats the first point at the end of the ring; both are dropped so the
+            # outline, the edges in Blender and the .osm way have no phantom vertices
+            clean = []
+            for q in pts:
+                if not clean or q != clean[-1]:
+                    clean.append(q)
+            pts = clean
             if len(pts) > 3 and pts[0] == pts[-1]:
-                pts.pop()                     # DSF repeats the first point
+                pts.pop()
             if len(pts) >= 3:
                 poly.rings.append(pts)
         if poly.rings:
