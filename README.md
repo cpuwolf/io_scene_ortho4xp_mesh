@@ -141,6 +141,7 @@ more detail.
 |---|---|
 | [doc/ortho4xp-mesh-format.md](doc/ortho4xp-mesh-format.md) | the `.mesh` format: MEDITS structure, both Ortho4XP flavours, units, the triangle region bit mask, the sibling `.node`/`.poly`/`.alt`/`.apt` files, editing pitfalls |
 | [doc/ortho4xp-patches-airports.md](doc/ortho4xp-patches-airports.md) | for Ortho4XP users: what a `Patches/…/*.patch.osm` can and cannot do, `altitude_high/low` quads, why airports get a denser mesh (`apt_curv_tol`), adding an airport OSM does not have, and how to verify it |
+| [doc/ortho4xp-obj-patches.md](doc/ortho4xp-obj-patches.md) | the OBJ8 route to the same levelling: where the `.obj` goes, the `ANCHOR`/`VT`/`TRIS` subset Ortho4XP reads, one minimal example, and the rules (height field only, first z wins, no texture) |
 | [doc/terrain-textures.md](doc/terrain-textures.md) | how the tile's `.ter` cells become materials + UVs, the lattice tiling, and the `tex_limit` / `tex_max_px` memory knobs |
 | [doc/import-and-export.md](doc/import-and-export.md) | every import and export option, the sidebar panel, what survives a round trip and what does not |
 | [doc/dsf-import.md](doc/dsf-import.md) | the DSF importer: 7z decoding, what is imported, the `.ter` mappings, known limits |
