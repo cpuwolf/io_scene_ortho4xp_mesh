@@ -47,6 +47,62 @@ IDX 0 2 3
 TRIS 0 6
 ```
 
+## The anchor's four numbers
+
+The anchor is an arbitrary local origin — Ortho4XP only uses it to *place* the geometry, so any
+point works as long as every `VT` is measured from it. What matters is that the four numbers and
+the `VT` coordinates agree:
+
+```
+vertex altitude = VT y + ANCHOR alt      (metres MSL)
+vertex position = anchor lon/lat + (VT x east, VT z south), rotated by ANCHOR heading
+```
+
+So `alt` does not have to be the real ground height; only the **sum** is the altitude. Two
+consistent styles:
+
+| style | `ANCHOR alt` | `VT y` |
+|---|---|---|
+| absolute | `0` | the vertex's own MSL altitude |
+| relative | the anchor's ground altitude | height above the anchor |
+
+### Taking it from a tile imported in Blender
+
+An imported `.mesh` carries the projection it was built with in the object's `mesh_georef`
+custom property — tile **centre** and the two metres-per-degree factors (measured on `+27+089`:
+
+```
+lon0 89.5    lat0 27.5
+m_per_deg_lat 111319.49079327357      m_per_deg_lon 98741.59427751697
+```
+
+The imported coordinates are metres from that centre, **not** degrees, so:
+
+```
+lon = lon0 + X / m_per_deg_lon
+lat = lat0 + Y / m_per_deg_lat
+```
+
+The simplest consistent anchor is the tile centre itself with altitude 0, because then the
+local coordinates are the Blender ones unchanged:
+
+```
+ANCHOR  lon0  lat0  0  0
+VT      x = vertex X            (east)
+        y = vertex Z            (MSL altitude)
+        z = −vertex Y           (obj z is south-positive, Blender Y is north-positive)
+```
+
+Measured on a real vertex of `+27+089`: `X −7893.755, Y −9909.625, Z 2236.61` with
+`ANCHOR 89.5 27.5 0 0` gives `lon 89.420056400 lat 27.410980300 z 2236.61` against
+`89.420056432 / 27.410980324 / 2236.61` in the `.mesh` — 3e-8°, i.e. the 7-decimal rounding
+`keep_obj8` applies itself (~3 mm).
+
+Keep the anchor at the tile centre if you can: `keep_obj8` scales longitudes by
+`cos(anchor lat)` while the imported frame used `cos(lat0)`, so an off-centre anchor drifts by
+~(1 − cos(lat_anchor)/cos(lat0)) × distance — centimetres for a patch a few hundred metres
+across, metres when the offset runs into kilometres.
+
 ## What Ortho4XP does with it
 
 1. `O4_Vector_Map.keep_obj8` maps every `VT` to a node at the tile-relative lon/lat and the
